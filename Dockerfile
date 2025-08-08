@@ -1,23 +1,23 @@
-# Usa una imagen base oficial y ligera de Node.js
+# Usa una imagen oficial y ligera de Node.js
 FROM node:20-slim
 
-# Establece el directorio de trabajo dentro del contenedor
+# Define el directorio de trabajo dentro del contenedor
 WORKDIR /app
 
-# Copia los archivos necesarios para instalar dependencias
+# Copia solo los archivos de dependencias primero (mejora la caché de builds)
 COPY package*.json ./
 
 # Instala solo dependencias de producción
 RUN npm install --omit=dev
 
-# Copia el resto del código fuente
+# Luego copia el resto del código fuente
 COPY . .
 
-# Asegura variables de entorno como producción
+# Asegura que el entorno esté en modo producción
 ENV NODE_ENV=production
 
-# Expone el puerto que usará CapRover
+# Expone el puerto esperado por CapRover
 EXPOSE 3000
 
-# Comando para iniciar el bot
+# Comando que arranca el bot
 CMD ["node", "index.js"]
