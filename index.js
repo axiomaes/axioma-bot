@@ -7,7 +7,7 @@ app.use(express.json())
 app.use(cors())
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY
-const MODEL = process.env.GROQ_MODEL || 'mixtral-8x7b-32768'
+const MODEL = process.env.GROQ_MODEL || 'llama3-70b-8192' // o el modelo activo que prefieras
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 if (!GROQ_API_KEY) {
@@ -20,36 +20,27 @@ app.get('/', (req, res) => {
 
 app.post('/chat', async (req, res) => {
   const { message } = req.body
-  if (!message) {
-    return res.status(400).json({ error: 'Message is required' })
-  }
+  if (!message) return res.status(400).json({ error: 'Message is required' })
 
   try {
-    const response = await axios.post(
-      GROQ_URL,
-      {
-        model: MODEL,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Eres un asesor comercial de Axioma Creativa, una agencia de marketing y publicidad. Tu objetivo es atraer al visitante, despertar su interés y explicar cómo nuestros servicios pueden ayudarle a impulsar su negocio o marca. Habla de forma cercana, entusiasta y profesional. Destaca que por lanzamiento estamos ofreciendo descuentos especiales y asesoría gratuita. Recomienda nuestros servicios de diseño, branding, marketing digital y desarrollo web, enfocándote en los beneficios concretos para el cliente. Motívalos a dar el siguiente paso para trabajar con nosotros.',
-          },
-          {
-            role: 'user',
-            content: message,
-          },
-        ],
-        temperature: 0.7,
-        max_tokens: 500,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json',
+    const response = await axios.post(GROQ_URL, {
+      model: MODEL,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Eres un asesor comercial de Axioma Creativa, una agencia de marketing y publicidad. Tu objetivo es atraer al visitante, despertar su interés y explicar cómo nuestros servicios pueden ayudarle a impulsar su negocio o marca. Habla de forma cercana, entusiasta y profesional. Destaca que por lanzamiento estamos ofreciendo descuentos especiales y asesoría gratuita. Recomienda nuestros servicios de diseño, branding, marketing digital y desarrollo web, enfocándote en los beneficios concretos para el cliente. Motívalos a dar el siguiente paso para trabajar con nosotros.',
         },
-      }
-    )
+        { role: 'user', content: message },
+      ],
+      temperature: 0.7,
+      max_tokens: 700,
+    }, {
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    })
 
     res.json({ response: response.data.choices[0].message.content })
   } catch (error) {
