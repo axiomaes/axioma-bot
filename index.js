@@ -20,7 +20,9 @@ app.get('/', (req, res) => {
 
 app.post('/chat', async (req, res) => {
   const { message } = req.body
-  if (!message) return res.status(400).json({ error: 'Message is required' })
+  if (!message) {
+    return res.status(400).json({ error: 'Message is required' })
+  }
 
   try {
     const response = await axios.post(GROQ_URL, {
@@ -29,12 +31,12 @@ app.post('/chat', async (req, res) => {
         {
           role: 'system',
           content:
-            'Responde como un asesor de Axioma Creativa con estilo moderno y directo, usando emojis, frases breves, sin rodeos. Promociona nuestros servicios creativos y menciona que estamos con descuentos por lanzamiento. Sé conversacional y motivador.',
+            'Eres un asistente alegre y amigable de Axioma Creativa. Hablas con emojis, frases cortas, y un tono relajado como si estuvieras en redes sociales. Tu objetivo es atraer clientes, generar interés y destacar los beneficios de los servicios creativos que ofrece Axioma Creativa. Siempre invita a aprovechar descuentos por lanzamiento. Sé divertido, directo y encantador.',
         },
         { role: 'user', content: message },
       ],
-      temperature: 0.7,
-      max_tokens: 400,
+      temperature: 0.8,
+      max_tokens: 500,
     }, {
       headers: {
         Authorization: `Bearer ${GROQ_API_KEY}`,
