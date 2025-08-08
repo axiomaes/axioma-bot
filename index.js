@@ -2,13 +2,17 @@ import express from 'express'
 import axios from 'axios'
 import cors from 'cors'
 
+// Configura dotenv si usas .env localmente
+// import dotenv from 'dotenv'
+// dotenv.config()
+
 const app = express()
 app.use(express.json())
 
-// CORS abierto solo si realmente necesitas exponerlo a frontend directo
+// CORS abierto globalmente si necesitas usarlo desde navegador
 app.use(cors({
-  origin: '*', // cámbialo por tu dominio si lo usas desde navegador
-  methods: ['POST', 'GET', 'OPTIONS'],
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }))
 
@@ -18,27 +22,28 @@ const MODEL = process.env.GROQ_MODEL || 'llama3-70b-8192'
 const GROQ_URL = process.env.GROQ_URL || 'https://api.groq.com/openai/v1/chat/completions'
 
 if (!GROQ_API_KEY) {
-  console.warn('⚠️  Falta GROQ_API_KEY. Configúralo en variables de entorno.')
+  console.warn('⚠️  Falta GROQ_API_KEY. Configúrala en variables de entorno.')
 }
 
-// Ruta básica para probar salud
-app.get('/', (req, res) => {
+// Ruta de prueba para comprobar si el servidor está vivo
+app.get('/', (_, res) => {
   res.json({ ok: true, service: 'axioma-bot' })
 })
 
-// Ruta principal que usa Chatwoot u otras apps
+// Ruta principal para Chatwoot u otros
 app.post('/chat', async (req, res) => {
-  // Flexibilidad para aceptar varios tipos de payload
+  // Acepta diferentes campos posibles
   const userMessage =
     req.body?.message ||
     req.body?.content ||
     req.body?.input ||
     req.body?.text ||
-    req.body?.conversation?.messages?.slice(-1)?.content ||
     ''
 
   if (!userMessage) {
-    return res.status(400).json({ error: 'No recibí ningún mensaje para procesar.' })
+    return res.status(200).json({
+      content: '❗️ No recibí ningún mensaje para procesar. ¿Puedes escribirlo de nuevo?',
+    })
   }
 
   try {
@@ -65,19 +70,24 @@ app.post('/chat', async (req, res) => {
     const botReply = response.data?.choices?.[0]?.message?.content?.trim()
 
     if (!botReply) {
-      return res.status(200).json({ content: '🤖 Lo siento, no pude generar respuesta. ¿Intentamos otra vez?' })
+      return res.status(200).json({
+        content: '🤖 Estoy aquí, pero no pude generar respuesta. ¿Puedes preguntarme otra vez?',
+      })
     }
 
-    res.json({ content: botReply }) // ✅ Compatible con Chatwoot
+    // ✅ Respuesta válida para Chatwoot
+    return res.status(200).json({ content: botReply })
   } catch (error) {
     console.error('❌ Error en la API:', error.response?.data || error.message)
-    res.status(200).json({
-      content: '⚠️ Ups... Hubo un problema al generar respuesta. ¿Puedes intentarlo en un momento? 😊',
+
+    // ✅ Siempre devuelve content como string, incluso si hay error
+    return res.status(200).json({
+      content: '😔 Lo siento, ahora mismo no puedo responder. ¿Intentamos más tarde?',
     })
   }
 })
 
-// Arranca servidor
+// Arranca el servidor
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
   console.log(`✅ Bot running on port ${PORT}`)
