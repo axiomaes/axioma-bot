@@ -28,14 +28,13 @@ app.post('/chat', async (req, res) => {
       messages: [
         {
           role: 'system',
-          content: `
-Eres el bot oficial de Axioma Creativa. Responde con un tono cercano, fresco y profesional. Usa emojis, frases cortas y muestra entusiasmo. Tu objetivo es explicar servicios, ayudar a los visitantes y lograr que contraten. Menciona que tenemos promociones activas por lanzamiento 🎉. Sé claro y enfocado en soluciones creativas de diseño, marketing y tecnología. Si preguntan precios, invítalos a cotizar sin compromiso.
-          `.trim(),
+          content:
+            'Responde como un asesor de Axioma Creativa con estilo moderno y directo, usando emojis, frases breves, sin rodeos. Promociona nuestros servicios creativos y menciona que estamos con descuentos por lanzamiento. Sé conversacional y motivador.',
         },
         { role: 'user', content: message },
       ],
       temperature: 0.7,
-      max_tokens: 500,
+      max_tokens: 400,
     }, {
       headers: {
         Authorization: `Bearer ${GROQ_API_KEY}`,
@@ -43,7 +42,8 @@ Eres el bot oficial de Axioma Creativa. Responde con un tono cercano, fresco y p
       },
     })
 
-    res.json({ response: response.data.choices[0].message.content })
+    const botReply = response.data.choices[0].message.content
+    res.json({ content: botReply }) // ✅ Compatible con Chatwoot
   } catch (error) {
     console.error('❌ Error en la API:', error.response?.data || error.message)
     res.status(500).json({ error: 'Error generating response' })
