@@ -3,48 +3,53 @@ import axios from 'axios'
 import cors from 'cors'
 
 const app = express()
-app.use(cors())
 app.use(express.json())
+app.use(cors())
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const MODEL = process.env.GROQ_MODEL || 'mixtral-8x7b-32768'
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 if (!GROQ_API_KEY) {
   console.warn('⚠️  Falta GROQ_API_KEY. Configúralo en variables de entorno.')
 }
 
-app.get('/', (_, res) => res.json({ ok: true, service: 'axioma-bot' }))
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'axioma-bot' })
+})
 
-// Endpoint simple para pruebas manuales
 app.post('/chat', async (req, res) => {
+  const { message } = req.body
+  if (!message) return res.status(400).json({ error: 'Message is required' })
+
   try {
-    const userMessage = (req.body.message || '').toString().trim() || 'Hola, ¿en qué puedo ayudarte?'
-
-    const { data } = await axios.post(
-      GROQ_URL,
-      {
-        model: MODEL,
-        messages: [{ role: 'user', content: userMessage }],
-        temperature: 0.7
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json'
+    const response = await axios.post(GROQ_URL, {
+      model: MODEL,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Actúa como un asesor de Axioma Creativa. Tu objetivo es responder preguntas, explicar servicios, resolver dudas y ayudar al visitante a contratar los servicios de la empresa. Sé profesional, claro y amigable.',
         },
-        timeout: 30000
-      }
-    )
+        { role: 'user', content: message },
+      ],
+      temperature: 0.7,
+      max_tokens: 500,
+    }, {
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    })
 
-    const reply = data?.choices?.[0]?.message?.content ?? '(sin respuesta)'
-    res.json({ reply })
-  } catch (err) {
-    console.error('❌ Error Groq:', err?.response?.data || err.message)
-    res.status(500).json({ error: 'Error interno del bot' })
+    res.json({ response: response.data.choices[0].message.content })
+  } catch (error) {
+    console.error(error.response?.data || error.message)
+    res.status(500).json({ error: 'Error generating response' })
   }
 })
 
-app.listen(3000, () => {
-  console.log('🤖 Axioma Bot escuchando en :3000')
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => {
+  console.log(`Bot running on port ${PORT}`)
 })
