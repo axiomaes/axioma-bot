@@ -1,23 +1,43 @@
-# Usa una imagen oficial y ligera de Node.js
-FROM node:20-slim
+# ===== STAGE 1: base =====
+FROM node:20-alpine AS base
 
-# Define el directorio de trabajo dentro del contenedor
+# Instalar tini para mejor manejo de señales (CTRL+C, docker stop)
+RUN apk add --no-cache tini
+
+# Crear carpeta de la app
 WORKDIR /app
 
-# Copia solo los archivos de dependencias primero (mejora la caché de builds)
+# Copiar package.json primero (cache de dependencias)
 COPY package*.json ./
 
-# Instala solo dependencias de producción
+# Instalar solo producción
 RUN npm install --omit=dev
 
-# Luego copia el resto del código fuente
+# Copiar el resto del código
 COPY . .
 
-# Asegura que el entorno esté en modo producción
-ENV NODE_ENV=production
+# ===== STAGE 2: run =====
+FROM node:20-alpine
 
-# Expone el puerto esperado por CapRover
+RUN apk add --no-cache tini
+
+WORKDIR /app
+
+# Copiamos desde la stage base (ya con node_modules instalado)
+COPY --from=base /app /app
+
+# Usar tini como entrypoint para manejo de señales
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# Variables de entorno por defecto
+ENV NODE_ENV=production \
+    PORT=3000 \
+    LOG_BODY=0 \
+    LOG_GROQ_RESP=0 \
+    VERIFY_HMAC=0
+
+# Exponer puerto
 EXPOSE 3000
 
-# Comando que arranca el bot
+# Comando por defecto
 CMD ["node", "index.js"]
