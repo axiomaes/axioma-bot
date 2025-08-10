@@ -1,4 +1,3 @@
-// index.js
 import express from 'express';
 import axios from 'axios';
 import cors from 'cors';
@@ -6,7 +5,6 @@ import cors from 'cors';
 const app = express();
 app.use(express.json());
 
-// CORS abierto
 app.use(
   cors({
     origin: '*',
@@ -15,31 +13,51 @@ app.use(
   })
 );
 
-// ===== Variables de entorno =====
+// ===== ENV =====
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const MODEL = process.env.GROQ_MODEL || 'llama3-70b-8192';
-const GROQ_URL =
-  process.env.GROQ_URL ||
-  'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_URL = process.env.GROQ_URL || 'https://api.groq.com/openai/v1/chat/completions';
+
+const CHATWOOT_URL = process.env.CHATWOOT_URL;
+const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
+const REPLY_VIA_API = process.env.REPLY_VIA_API === '1';
 
 const LOG_BODY = process.env.LOG_BODY === '1';
 const LOG_GROQ_RESP = process.env.LOG_GROQ_RESP === '1';
 const LOG_DECISIONS = process.env.LOG_DECISIONS === '1';
 
-if (!GROQ_API_KEY) {
-  console.warn('⚠️  Falta GROQ_API_KEY en variables de entorno.');
+if (!GROQ_API_KEY) console.warn('⚠️ Falta GROQ_API_KEY');
+
+// ===== dedupe simple en memoria =====
+const respondedMap = new Map(); // key -> timestamp
+const DEDUPE_TTL_MS = 2 * 60 * 1000; // 2 min
+
+function dedupeKeyFromPayload(b) {
+  // mensaje explícito
+  const mid = b?.message?.id || b?.id;
+  if (mid) return `mid:${mid}`;
+  // último mensaje de la conversación
+  const last = Array.isArray(b?.conversation?.messages)
+    ? b.conversation.messages[b.conversation.messages.length - 1]
+    : undefined;
+  if (last?.id) return `convLast:${b?.conversation?.id}:${last.id}`;
+  // fallback
+  return `conv:${b?.conversation?.id}:ts:${b?.created_at || Date.now()}`;
 }
 
-app.get('/', (_, res) => {
-  res.json({
-    ok: true,
-    service: 'axioma-bot',
-    model: MODEL,
-    groq_url: GROQ_URL,
-  });
-});
+function hasRecentlyResponded(key) {
+  const now = Date.now();
+  for (const [k, ts] of respondedMap) {
+    if (now - ts > DEDUPE_TTL_MS) respondedMap.delete(k);
+  }
+  if (!key) return false;
+  const ts = respondedMap.get(key);
+  if (ts && now - ts < DEDUPE_TTL_MS) return true;
+  respondedMap.set(key, now);
+  return false;
+}
 
-// Helper: extraer el texto del usuario desde payloads variados
+// ===== helpers =====
 function extractUserMessage(body) {
   return (
     body?.message?.content ||
@@ -53,87 +71,91 @@ function extractUserMessage(body) {
   );
 }
 
-// ===== Ruta principal (webhook Chatwoot) =====
-app.post('/chat', async (req, res) => {
-  const reqId = Math.random().toString(36).slice(2, 10);
-  const now = new Date().toISOString();
-  console.log(`[${now}] [${reqId}] ⇢ POST /chat from ${req.ip}`);
-
-  if (LOG_BODY) {
-    console.log(`[${reqId}] ⇢ Headers:`, req.headers);
-    try {
-      console.log(
-        `[${reqId}] ⇢ Body:`,
-        JSON.stringify(req.body, null, 2)
-      );
-    } catch {}
-  }
-
-  // ---------- Filtro robusto para decidir si responder ----------
-  const body = req.body;
-
-  // Último mensaje de la conversación (cuando viene agrupado)
+function shouldReplyTo(body) {
   const lastMsg = Array.isArray(body?.conversation?.messages)
     ? body.conversation.messages[body.conversation.messages.length - 1]
     : undefined;
 
-  // Señales de "entrante"
   const isIncoming =
     body?.message_type === 'incoming' ||
     body?.message?.message_type === 'incoming' ||
     lastMsg?.message_type === 'incoming' ||
-    lastMsg?.message_type === 0; // Chatwoot usa 0 en modelos internos
+    lastMsg?.message_type === 0;
 
-  // Privado?
   const isPrivate =
     body?.private === true ||
     body?.message?.private === true ||
     lastMsg?.private === true;
 
-  // Tipo de remitente, si viene
   const senderType =
     body?.sender?.type ||
     body?.message?.sender_type ||
     body?.sender_type ||
     lastMsg?.sender_type;
 
-  // Cuando sabemos que viene de agente/usuario interno, no respondemos
   const knownAgentTypes = ['agent', 'user', 'system'];
   const isFromAgent =
-    senderType &&
-    knownAgentTypes.includes(String(senderType).toLowerCase());
+    senderType && knownAgentTypes.includes(String(senderType).toLowerCase());
 
-  // Decisión final: contestar solo si es entrante y no es privado y no es de agente.
-  // Si senderType está ausente, asumimos cliente para no saltarnos mensajes del widget.
-  const shouldReply = Boolean(isIncoming && !isPrivate && !isFromAgent);
+  const decision = Boolean(isIncoming && !isPrivate && !isFromAgent);
 
   if (LOG_DECISIONS) {
     console.log(
-      `[${reqId}] decision: incoming=${!!isIncoming} private=${!!isPrivate} senderType=${senderType ?? '[absent]'} => shouldReply=${shouldReply}`
+      `[decision] incoming=${!!isIncoming} private=${!!isPrivate} senderType=${senderType ?? '[absent]'} => shouldReply=${decision}`
     );
   }
+  return decision;
+}
 
-  if (!shouldReply) {
+// ===== endpoint de salud =====
+app.get('/', (_, res) => {
+  res.json({
+    ok: true,
+    model: MODEL,
+    groq_url: GROQ_URL,
+    reply_via_api: REPLY_VIA_API,
+  });
+});
+
+// ===== webhook principal =====
+app.post('/chat', async (req, res) => {
+  const reqId = Math.random().toString(36).slice(2, 10);
+  console.log(`[${new Date().toISOString()}] [${reqId}] ⇢ POST /chat from ${req.ip}`);
+
+  if (LOG_BODY) {
+    console.log(`[${reqId}] ⇢ Headers:`, req.headers);
+    try {
+      console.log(`[${reqId}] ⇢ Body:`, JSON.stringify(req.body, null, 2));
+    } catch {}
+  }
+
+  const body = req.body;
+
+  // Filtro: solo contestar a entrantes de cliente
+  if (!shouldReplyTo(body)) {
     return res.status(200).json({ ok: true, skipped: true });
   }
-  // -------------------------------------------------------------
+
+  // Antiduplicados
+  const dkey = dedupeKeyFromPayload(body);
+  if (hasRecentlyResponded(dkey)) {
+    if (LOG_DECISIONS) console.log(`[${reqId}] ⛔ dedupe skip key=${dkey}`);
+    return res.status(200).json({ ok: true, deduped: true });
+  }
 
   const userMessage = extractUserMessage(body).trim();
   if (!userMessage) {
     return res.status(200).json({
-      content:
-        '❗️ No recibí ningún mensaje para procesar. ¿Puedes escribirlo de nuevo?',
+      content: '❗️ No recibí ningún mensaje. ¿Puedes repetirlo?',
       private: false,
     });
   }
 
   // Llamada a GROQ
-  console.log(
-    `[${reqId}] ⇢ GROQ model=${MODEL} url=${GROQ_URL}`
-  );
-
+  console.log(`[${reqId}] ⇢ GROQ model=${MODEL} url=${GROQ_URL}`);
+  let botReply = '';
   try {
-    const groqResp = await axios.post(
+    const r = await axios.post(
       GROQ_URL,
       {
         model: MODEL,
@@ -141,7 +163,7 @@ app.post('/chat', async (req, res) => {
           {
             role: 'system',
             content:
-              'Eres el asistente de Axioma Creativa. Responde en español, tono cercano y con algunos emojis. Sé conciso (máx. 3–4 frases) y orienta a la acción (CTA claro) o pueden solicitar una cita en esta direccion https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo.',
+              'Eres el asistente de Axioma Creativa. Responde en español, cálido y claro, con 1–2 emojis máx. Sé conciso (3–4 frases) y cierra con una CTA.',
           },
           { role: 'user', content: userMessage },
         ],
@@ -158,56 +180,71 @@ app.post('/chat', async (req, res) => {
     );
 
     if (LOG_GROQ_RESP) {
-      console.log(`[${reqId}] ⇠ GROQ:`, JSON.stringify(groqResp.data, null, 2));
+      console.log(`[${reqId}] ⇠ GROQ:`, JSON.stringify(r.data, null, 2));
     }
 
-    const botReply =
-      groqResp?.data?.choices?.[0]?.message?.content?.trim();
-
-    if (!botReply) {
-      return res.status(200).json({
-        content:
-          '🤖 Estoy aquí, pero no pude generar respuesta. ¿Puedes preguntarme otra vez?',
-        private: false,
-      });
-    }
-
-    console.log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 120)}…`);
-    // Chatwoot espera { content, private }
-    return res.status(200).json({
-      content: botReply,
-      private: false,
-    });
+    botReply = r?.data?.choices?.[0]?.message?.content?.trim() || '';
+    if (!botReply) botReply = '🤖 Aquí estoy, ¿puedes reformular tu pregunta?';
+    console.log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 140)}…`);
   } catch (err) {
     const status = err?.response?.status;
     const data = err?.response?.data;
-    console.error(
-      `[${reqId}] ❌ Error GROQ:`,
-      status ? `status=${status}` : '',
-      data || err.message
-    );
-
-    // Mensaje amable en caso de rate-limit / error
-    let msg =
-      '😔 Lo siento, ahora mismo no puedo responder. ¿Intentamos de nuevo en unos segundos?';
-    if (
-      data?.error?.code === 'rate_limit_exceeded' ||
-      /rate limit/i.test(JSON.stringify(data || ''))
-    ) {
-      msg =
-        '⏳ Vamos un pelín saturados ahora mismo. Intento contestarte en unos segundos, ¿vale?';
+    console.error(`[${reqId}] ❌ Error GROQ:`, status ? `status=${status}` : '', data || err.message);
+    if (data?.error?.code === 'rate_limit_exceeded') {
+      botReply = '⏳ Vamos con mucha carga. Intento responderte en unos segundos.';
+    } else {
+      botReply = '😔 Ha ocurrido un problema técnico. ¿Probamos de nuevo en un momento?';
     }
+  }
 
-    return res.status(200).json({ content: msg, private: false });
+  // 1) Respuesta síncrona (lo que espera Chatwoot Agent Bot)
+  //    -> esto debería crear el mensaje en la conversación
+  const syncPayload = { content: botReply, private: false };
+  // No añadir otros campos para que Chatwoot no se líe
+  res.status(200).json(syncPayload);
+
+  // 2) (Opcional) Empujar también por API para asegurar entrega en el widget
+  if (REPLY_VIA_API && CHATWOOT_URL && CHATWOOT_TOKEN) {
+    try {
+      const accountId = body?.account?.id || 1;
+      const convId = body?.conversation?.id;
+      if (convId) {
+        await axios.post(
+          `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${convId}/messages`,
+          {
+            content: botReply,
+            message_type: 'outgoing',
+            private: false,
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Api-Access-Token': CHATWOOT_TOKEN,
+            },
+            timeout: 10000,
+          }
+        );
+        console.log(`[${reqId}] ✓ pushed via Chatwoot API conv=${convId}`);
+      } else {
+        console.warn(`[${reqId}] ⚠️ no convId para push API`);
+      }
+    } catch (err) {
+      console.error(
+        `[${reqId}] ❌ fallo push API Chatwoot:`,
+        err?.response?.status,
+        err?.response?.data || err.message
+      );
+    }
   }
 });
 
-// Arranque
+// ===== start =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('✅ Bot running on port', PORT);
+  console.log(`✅ Bot running on port ${PORT}`);
   console.log('Model:', MODEL);
   console.log('GROQ_URL:', GROQ_URL);
+  console.log('REPLY_VIA_API:', REPLY_VIA_API ? 'ON' : 'OFF');
   console.log('LOG_BODY:', LOG_BODY ? 'ON' : 'OFF');
   console.log('LOG_GROQ_RESP:', LOG_GROQ_RESP ? 'ON' : 'OFF');
   console.log('LOG_DECISIONS:', LOG_DECISIONS ? 'ON' : 'OFF');
