@@ -1,198 +1,111 @@
-// index.js
 import express from 'express'
 import axios from 'axios'
 import cors from 'cors'
 
 const app = express()
 app.use(express.json())
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token'] }))
 
-// CORS abierto
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'api_access_token'],
-}))
-
-// ====== ENV ======
+// IA (GROQ)
 const GROQ_API_KEY = process.env.GROQ_API_KEY
-const MODEL        = process.env.GROQ_MODEL || 'llama3-70b-8192'
-const GROQ_URL     = process.env.GROQ_URL   || 'https://api.groq.com/openai/v1/chat/completions'
+const MODEL = process.env.GROQ_MODEL || 'llama3-70b-8192'
+const GROQ_URL = process.env.GROQ_URL || 'https://api.groq.com/openai/v1/chat/completions'
 
 // Chatwoot
-const CHATWOOT_URL       = process.env.CHATWOOT_URL || '' // ej: https://asistente-chatwoot-web.stacks.axioma-creativa.es
-const CHATWOOT_TOKEN     = process.env.CHATWOOT_TOKEN || '' // token personal de usuario/agent (o bot token si tienes uno válido para API)
-const CHATWOOT_AUTH_MODE = (process.env.CHATWOOT_AUTH_MODE || 'query').toLowerCase()
-// modos soportados: 'query' | 'header' | 'bearer'
-// - 'query' usa ?api_access_token=TOKEN  (recomendado si hay dudas con Nginx)
-// - 'header' usa header: api_access_token: TOKEN
-// - 'bearer' usa header: Authorization: Bearer TOKEN
+const CHATWOOT_URL = process.env.CHATWOOT_URL
+const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN
+const CHATWOOT_AUTH_MODE = (process.env.CHATWOOT_AUTH_MODE || 'xheader').toLowerCase()
 
-const LOG_BODY      = process.env.LOG_BODY === '1'
-const LOG_GROQ_RESP = process.env.LOG_GROQ_RESP === '1'
+if (!GROQ_API_KEY) console.warn('⚠️ Falta GROQ_API_KEY')
+if (!CHATWOOT_URL) console.warn('⚠️ Falta CHATWOOT_URL')
+if (!CHATWOOT_TOKEN) console.warn('⚠️ Falta CHATWOOT_TOKEN')
 
-// ====== Helpers ======
-function pickUserMessage(body) {
-  // Prioriza campos típicos de Chatwoot; acepta variantes
-  return body?.content
-      || body?.message
-      || body?.input
-      || body?.text
-      || ''
-}
+// ping
+app.get('/', (_, res) => res.json({ ok: true, service: 'axioma-bot' }))
 
-function pickIds(body) {
-  const accountId      = body?.account?.id ?? body?.account_id
-  const conversationId = body?.conversation?.id ?? body?.conversation_id
-  return { accountId, conversationId }
-}
+// util: enviar a chatwoot
+async function sendChatwootMessage ({ accountId, conversationId, content }) {
+  if (!CHATWOOT_URL || !CHATWOOT_TOKEN) throw new Error('CHATWOOT_URL/TOKEN no configurados')
+  if (!accountId || !conversationId) throw new Error('Faltan accountId/conversationId')
 
-async function sendChatwootMessage({ accountId, conversationId, content }) {
-  if (!CHATWOOT_URL) throw new Error('CHATWOOT_URL no definido')
-  if (!CHATWOOT_TOKEN) throw new Error('CHATWOOT_TOKEN no definido')
-  if (!accountId || !conversationId) throw new Error('Faltan accountId o conversationId')
-
-  const base = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
-
-  let url = base
+  let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
   const headers = { 'Content-Type': 'application/json' }
 
-  if (CHATWOOT_AUTH_MODE === 'query') {
-    const sep = base.includes('?') ? '&' : '?'
-    url = `${base}${sep}api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
-  } else if (CHATWOOT_AUTH_MODE === 'bearer') {
-    headers.Authorization = `Bearer ${CHATWOOT_TOKEN}`
-  } else { // 'header'
+  // aplica el modo de auth
+  if (CHATWOOT_AUTH_MODE === 'xheader') {
+    headers['X-Api-Access-Token'] = CHATWOOT_TOKEN
+  } else if (CHATWOOT_AUTH_MODE === 'header') {
     headers['api_access_token'] = CHATWOOT_TOKEN
+  } else if (CHATWOOT_AUTH_MODE === 'bearer') {
+    headers['Authorization'] = `Bearer ${CHATWOOT_TOKEN}`
+  } else { // query
+    const sep = url.includes('?') ? '&' : '?'
+    url = `${url}${sep}api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
   }
 
-  const payload = {
-    content,
-    message_type: 'outgoing',
-    private: false,
-  }
+  // log seguro
+  console.log(`[sendChatwootMessage] mode=${CHATWOOT_AUTH_MODE} url=${url}`)
 
-  const resp = await axios.post(url, payload, { headers, timeout: 15000 })
-  return resp.data
+  const payload = { content, message_type: 'outgoing', private: false }
+  const { data } = await axios.post(url, payload, { headers, timeout: 10000 })
+  return data
 }
 
-// ====== Rutas ======
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'axioma-bot',
-    model: MODEL,
-    chatwoot: {
-      url: CHATWOOT_URL || '[unset]',
-      auth_mode: CHATWOOT_AUTH_MODE,
-      token_present: Boolean(CHATWOOT_TOKEN),
-    },
-  })
-})
-
+// endpoint principal (webhook simulado/real)
 app.post('/chat', async (req, res) => {
   const reqId = Math.random().toString(36).slice(2, 10)
-  const now = new Date().toISOString()
-  console.log(`[${now}] [${reqId}] ⇢ POST /chat from ${req.ip} UA="${req.headers['user-agent'] || ''}"`)
-  if (LOG_BODY) {
-    console.log(`[${reqId}] ⇢ Headers:`, JSON.stringify(req.headers))
-    console.log(`[${reqId}] ⇢ Body:`, JSON.stringify(req.body, null, 2))
-  }
+  const ip = req.headers['x-forwarded-for'] || req.ip
+  console.log(`[${new Date().toISOString()}] [${reqId}] ⇢ POST /chat from ${ip}`)
 
-  // Solo procesamos mensajes nuevos (event: message_created) si viene de Chatwoot,
-  // pero no lo exigimos para permitir pruebas con curl.
-  const userMessage = pickUserMessage(req.body)
-  if (!userMessage) {
-    console.log(`[${reqId}] ✱ Sin mensaje en el payload`)
-    return res.status(200).json({
-      content: '❗️ No recibí ningún mensaje. ¿Puedes escribirlo de nuevo?',
-      content_type: 'text',
-      private: false,
-    })
-  }
-
-  if (!GROQ_API_KEY) {
-    console.warn(`[${reqId}] ⚠️ Falta GROQ_API_KEY`)
-  }
-
-  console.log(`[${reqId}] ⇢ GROQ request → model=${MODEL} url=${GROQ_URL}`)
   try {
-    const groqResp = await axios.post(
-      GROQ_URL,
-      {
-        model: MODEL,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Eres un asistente alegre y amigable de Axioma Creativa. Hablas con emojis, frases cortas y un tono cercano. Tu objetivo es atraer clientes, generar interés y destacar beneficios de servicios creativos (web, contenido, IA). Invita a aprovechar descuentos de lanzamiento cuando encaje.',
-          },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0.8,
-        max_tokens: 500,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 15000,
-      }
-    )
+    // extrae mensaje y metadatos de chatwoot
+    const body = req.body || {}
+    const userMessage = body.message || body.content || body.input || body.text || ''
+    const accountId = body.account?.id || body.account_id || 1
+    const conversationId = body.conversation?.id || body.conversation_id || body.conversationId || 1
 
-    if (LOG_GROQ_RESP) {
-      console.log(`[${reqId}] ⇠ GROQ data:`, JSON.stringify(groqResp.data, null, 2))
-    } else {
-      console.log(`[${reqId}] ⇠ GROQ status=${groqResp.status}`)
+    if (!userMessage) {
+      return res.status(200).json({ content: '❗️ No recibí ningún mensaje.', private: false })
     }
 
-    const botReply = groqResp.data?.choices?.[0]?.message?.content?.trim()
-    if (!botReply) {
-      console.log(`[${reqId}] ⚠️ Respuesta vacía de GROQ`)
-      return res.status(200).json({
-        content: '🤖 Estoy aquí, pero no pude generar respuesta. ¿Puedes preguntarme otra vez?',
-        content_type: 'text',
-        private: false,
-      })
-    }
-
-    console.log(`[${reqId}] ⇢ BotReply: ${botReply}`)
-
-    // Publicar en Chatwoot si tenemos IDs
-    const { accountId, conversationId } = pickIds(req.body)
-    if (accountId && conversationId) {
-      try {
-        const data = await sendChatwootMessage({ accountId, conversationId, content: botReply })
-        console.log(`[${reqId}] ✅ Mensaje publicado en Chatwoot (acc=${accountId}, conv=${conversationId}) id=${data?.id ?? '?'}`)
-      } catch (err) {
-        const e = err?.response?.data || err?.message
-        console.error(`[${reqId}] ❌ Error enviando a Chatwoot:`, e)
-      }
-    } else {
-      console.warn(`[${reqId}] ⚠️ payload sin account_id o conversation_id; no se publica en Chatwoot`)
-    }
-
-    // Siempre respondemos 200 al webhook
-    return res.status(200).json({
-      content: botReply,
-      content_type: 'text',
-      private: false,
+    // llamar a groq
+    console.log(`[${reqId}] ⇢ GROQ model=${MODEL} url=${GROQ_URL}`)
+    const groq = await axios.post(GROQ_URL, {
+      model: MODEL,
+      messages: [
+        { role: 'system', content: 'Eres un asistente alegre de Axioma Creativa. Usa emojis, tono cercano y enfocado a conversión.' },
+        { role: 'user', content: userMessage }
+      ],
+      temperature: 0.8,
+      max_tokens: 500
+    }, {
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      timeout: 15000
     })
-  } catch (error) {
-    console.error(`[${reqId}] ❌ Error en la API GROQ:`, error?.response?.data || error.message)
-    return res.status(200).json({
-      content: '😔 Ahora mismo no puedo responder. ¿Intentamos más tarde?',
-      content_type: 'text',
-      private: false,
-    })
+
+    const botReply = groq.data?.choices?.[0]?.message?.content?.trim() || '🙂'
+    console.log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 140)}${botReply.length > 140 ? '…' : ''}`)
+
+    // enviar a chatwoot
+    try {
+      const r = await sendChatwootMessage({ accountId, conversationId, content: botReply })
+      console.log(`[${reqId}] ✅ Publicado en Chatwoot (acc=${accountId}, conv=${conversationId}) id=${r?.id || 'n/a'}`)
+    } catch (e) {
+      console.error(`[${reqId}] ❌ Error enviando a Chatwoot:`, e.response?.data || e.message)
+    }
+
+    // respuesta al webhook
+    return res.status(200).json({ content: botReply, private: false })
+  } catch (err) {
+    console.error(`[ERR]`, err.response?.data || err.message)
+    return res.status(200).json({ content: '😔 Ahora mismo no puedo responder.', private: false })
   }
 })
 
-// ====== Arranque ======
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
   console.log(`✅ Bot running on port ${PORT}`)
   console.log(`   Model: ${MODEL}`)
   console.log(`   GROQ_URL: ${GROQ_URL}`)
-  console.log(`   Options: LOG_BODY=${LOG_BODY ? 1 : 0} LOG_GROQ_RESP=${LOG_GROQ_RESP ? 1 : 0}`)
+  console.log(`   CHATWOOT_AUTH_MODE: ${CHATWOOT_AUTH_MODE}`)
 })
