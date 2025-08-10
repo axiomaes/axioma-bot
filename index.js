@@ -8,6 +8,7 @@ app.use(express.json({ limit: '1mb' }))
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
+  // añadimos también 'api_access_token' por si algún cliente lo envía desde navegador
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token', 'api_access_token'],
 }))
 
@@ -23,7 +24,14 @@ const {
   LOG_BODY = '0',
   LOG_GROQ_RESP = '0',
   LOG_DECISIONS = '0',
+
+  // --- NUEVO: control editable por ENV ---
   CTA_URL = 'https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo',
+  SYSTEM_PROMPT_EXTRA = 'En agosto y septiembre tenemos descuentos activos. Comunica que son plazas limitadas.',
+  PRICE_BASE_JSON = '{"diagnostico":0,"asesoria":49,"auto_min":120,"content_mes":190,"moneda":"EUR"}',
+  PROMO_ACTIVE = '1',
+  PROMO_PCT = '20',
+  PROMO_UNTIL = '2025-09-30'
 } = process.env
 
 function log(...args) { console.log(...args) }
@@ -72,23 +80,49 @@ function extractAccountId(body) {
       ?? 1
 }
 
-// ==== Heurística simple de intención de precio ====
+// === NUEVO: precios y promos desde ENV ===
 const PRICE_KEYWORDS = [
-  'precio', 'precios', 'tarifa', 'tarifas', 'cuánto', 'cuanto', 'coste', 'costo', 'vale', 'vale?', 'presupuesto'
+  'precio','precios','tarifa','tarifas','cuánto','cuanto','coste','costo','vale','presupuesto'
 ]
 function isPriceQuery(text) {
   const t = (text || '').toLowerCase()
   return PRICE_KEYWORDS.some(k => t.includes(k))
 }
+const promoOn = () => {
+  if (!(PROMO_ACTIVE === '1' || PROMO_ACTIVE === 'true')) return false
+  if (!PROMO_UNTIL) return true
+  try { return new Date() <= new Date(PROMO_UNTIL) } catch { return true }
+}
+function priceData() {
+  let base = { diagnostico:0, asesoria:49, auto_min:120, content_mes:190, moneda:'EUR' }
+  try { base = { ...base, ...JSON.parse(PRICE_BASE_JSON) } } catch {}
+  if (promoOn()) {
+    const pct = Math.max(0, Math.min(90, Number(PROMO_PCT) || 0))
+    const factor = (100 - pct) / 100
+    base = {
+      ...base,
+      diagnostico: base.diagnostico, // gratis se queda
+      asesoria: Math.round(base.asesoria * factor),
+      auto_min: Math.round(base.auto_min * factor),
+      content_mes: Math.round(base.content_mes * factor),
+      promo_pct: pct
+    }
+  }
+  return base
+}
 function priceReply() {
+  const p = priceData()
+  const moneda = p.moneda === 'EUR' ? '€' : (p.moneda || '€')
+  const promoLine = p.promo_pct ? `\n🔖 Promo ${p.promo_pct}% ${PROMO_UNTIL ? `hasta ${PROMO_UNTIL}` : ''}. Plazas limitadas.` : ''
   return [
-    '💡 Te cuento precios orientativos (accesibles) para empezar:',
-    '• Sesión de diagnóstico 30 min: **gratis**.',
-    '• Asesoría 60 min para tu caso: **49 €**.',
-    '• Automatización ligera (formularios → sheets/email): **desde 120–240 €**.',
-    '• Paquete mensual de contenidos asistidos por IA: **desde 190 €/mes**.',
+    '💡 Precios orientativos (accesibles):',
+    `• Sesión de diagnóstico 30 min: **gratis**.`,
+    `• Asesoría 60 min: **${p.asesoria}${moneda}**.`,
+    `• Automatización ligera (formularios → sheets/email): **desde ${p.auto_min}${moneda}**.`,
+    `• Contenidos asistidos por IA (mensual): **desde ${p.content_mes}${moneda}/mes**.`,
+    promoLine,
     '',
-    `¿Te va bien agendar una cita de descubrimiento? Aquí puedes elegir hora: ${CTA_URL}`
+    `📅 Reserva aquí: ${CTA_URL}`
   ].join('\n')
 }
 function ensureCTA(text) {
@@ -100,14 +134,12 @@ function ensureCTA(text) {
 async function postToChatwoot({ accountId, conversationId, content }) {
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
   const headers = { 'Content-Type': 'application/json' }
-
   // Para tu instancia: usar header api_access_token (no X-Api-Access-Token)
   if (CHATWOOT_AUTH_MODE === 'xheader') {
     headers['api_access_token'] = CHATWOOT_TOKEN
   } else {
     url += (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
   }
-
   return axios.post(url, {
     content,
     message_type: 'outgoing',
@@ -131,18 +163,10 @@ app.post('/chat', async (req, res) => {
   const event = req.body?.event || ''
 
   // Aceptar message_type/sender_type en message.* o a nivel raíz
-  const typeRaw =
-    req.body?.message?.message_type ??
-    req.body?.message_type
-  const senderTypeRaw =
-    req.body?.message?.sender_type ??
-    req.body?.sender_type ??
-    ''
+  const typeRaw = req.body?.message?.message_type ?? req.body?.message_type
+  const senderTypeRaw = req.body?.message?.sender_type ?? req.body?.sender_type ?? ''
   const typeStr = String(typeRaw).toLowerCase()
-  const isIncoming =
-    typeRaw === 0 ||
-    typeRaw === '0' ||
-    typeStr === 'incoming' // 0 | "0" | "incoming"
+  const isIncoming = (typeRaw === 0) || (typeRaw === '0') || (typeStr === 'incoming')
   const senderType = String(senderTypeRaw).toLowerCase()
   const isContact = senderType ? senderType === 'contact' : isIncoming
 
@@ -205,14 +229,13 @@ app.post('/chat', async (req, res) => {
       messages: [
         {
           role: 'system',
-          content:
-            [
-              'Eres el asistente de Axioma Creativa (Madrid). Tono: cercano, profesional y proactivo, con emojis moderados.',
-              'Objetivo: entender necesidad, dar una respuesta clara y una siguiente acción.',
-              'Si el usuario pide precios o presupuesto: DA rangos ACCESIBLES en EUR (49€, 120–240€, 190€/mes) y sugiere opciones.',
-              `Cierra SIEMPRE con una invitación a agendar en: ${CTA_URL}`,
-              'Evita respuestas largas, usa frases cortas y listas. No inventes datos.'
-            ].join(' ')
+          content: [
+            'Eres el asistente de Axioma Creativa (Madrid). Tono: cercano, profesional y proactivo; usa emojis con moderación.',
+            'Objetivo: entender, responder claro y proponer la siguiente acción.',
+            'Si el usuario pide precios: da rangos ACCESIBLES en EUR y sugiere opciones.',
+            `Cierra SIEMPRE invitando a agendar en: ${CTA_URL}.`,
+            SYSTEM_PROMPT_EXTRA // ← editable por ENV
+          ].join(' ')
         },
         { role: 'user', content: userMessage }
       ],
@@ -232,10 +255,9 @@ app.post('/chat', async (req, res) => {
     let botReply = g.data?.choices?.[0]?.message?.content?.trim()
     if (!botReply) {
       log(`[${reqId}] ⚠️ Respuesta vacía de GROQ`)
-      botReply = 'Puedo ayudarte con ideas y automaciones útiles. ¿Te va bien una llamada rápida?\n\n📅 Agenda aquí: ' + CTA_URL
-    } else {
-      botReply = ensureCTA(botReply)
+      botReply = 'Puedo ayudarte con ideas y automatizaciones útiles. ¿Te va bien una llamada rápida?'
     }
+    botReply = ensureCTA(botReply)
 
     log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 140)}${botReply.length > 140 ? '…' : ''}`)
     res.status(200).json({ content: botReply, private: false })
