@@ -141,7 +141,7 @@ app.post('/chat', async (req, res) => {
           {
             role: 'system',
             content:
-              'Eres el asistente de Axioma Creativa. Responde en español, tono cercano y con algunos emojis. Sé conciso (máx. 3–4 frases) y orienta a la acción (CTA claro).',
+              'Eres el asistente de Axioma Creativa. Responde en español, tono cercano y con algunos emojis. Sé conciso (máx. 3–4 frases) y orienta a la acción (CTA claro) o pueden solicitar una cita en esta direccion https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo.',
           },
           { role: 'user', content: userMessage },
         ],
