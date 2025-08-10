@@ -46,7 +46,6 @@ setInterval(() => {
 const isTruthy = v => v === 1 || v === '1' || v === true || v === 'true'
 
 function extractIncomingText(body) {
-  // Intenta varios campos típicos
   return body?.message?.content
       ?? body?.content
       ?? body?.text
@@ -99,9 +98,12 @@ app.post('/chat', async (req, res) => {
     log(`[${reqId}] ⇢ Body:`, JSON.stringify(req.body, null, 2))
   }
 
-  // Solo procesar eventos de creación de mensaje entrante del contacto
   const event = req.body?.event || ''
-  const isIncoming = (req.body?.message?.message_type === 0 || req.body?.message?.message_type === 'incoming')
+
+  // MODIFICADO para aceptar 0, "0" o "incoming"
+  const type = req.body?.message?.message_type
+  const isIncoming = type === 0 || type === '0' || String(type).toLowerCase() === 'incoming'
+
   const isContact = (req.body?.message?.sender_type || '').toLowerCase() === 'contact'
 
   if (isTruthy(LOG_DECISIONS)) {
@@ -167,10 +169,8 @@ app.post('/chat', async (req, res) => {
 
     log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 120)}${botReply.length > 120 ? '…' : ''}`)
 
-    // Respondemos al hook rápido
     res.status(200).json({ content: botReply, private: false })
 
-    // Publicar en Chatwoot si está activado
     if (isTruthy(REPLY_VIA_API)) {
       const conversationId = extractConversationId(req.body)
       const accountId = extractAccountId(req.body)
@@ -202,11 +202,9 @@ app.post('/chat', async (req, res) => {
     const status = err?.response?.status
     const data = err?.response?.data || err.message
     log(`[${reqId}] ❌ GROQ error status=${status} body=${JSON.stringify(data)}`)
-    // Aun así devolvemos 200 al hook para que no reintente sin fin
     return res.status(200).json({ content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo?', private: false })
   }
 })
 
-// Start
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {})
