@@ -1,251 +1,212 @@
-import express from 'express';
-import axios from 'axios';
-import cors from 'cors';
+import express from 'express'
+import axios from 'axios'
+import cors from 'cors'
 
-const app = express();
-app.use(express.json());
+const app = express()
+app.use(express.json({ limit: '1mb' }))
 
-app.use(
-  cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token'],
-  })
-);
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token'],
+}))
 
-// ===== ENV =====
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const MODEL = process.env.GROQ_MODEL || 'llama3-70b-8192';
-const GROQ_URL = process.env.GROQ_URL || 'https://api.groq.com/openai/v1/chat/completions';
+// === Env ===
+const {
+  GROQ_API_KEY,
+  GROQ_MODEL = 'llama3-70b-8192',
+  GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions',
+  CHATWOOT_URL = '',
+  CHATWOOT_TOKEN = '',
+  CHATWOOT_AUTH_MODE = 'xheader', // xheader | query
+  REPLY_VIA_API = '0',
+  LOG_BODY = '0',
+  LOG_GROQ_RESP = '0',
+  LOG_DECISIONS = '0',
+} = process.env
 
-const CHATWOOT_URL = process.env.CHATWOOT_URL;
-const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
-const REPLY_VIA_API = process.env.REPLY_VIA_API === '1';
+function log(...args) { console.log(...args) }
+function nowId() { return Math.random().toString(36).slice(2, 10) }
 
-const LOG_BODY = process.env.LOG_BODY === '1';
-const LOG_GROQ_RESP = process.env.LOG_GROQ_RESP === '1';
-const LOG_DECISIONS = process.env.LOG_DECISIONS === '1';
+log('✅ Bot running on port', process.env.PORT || 3000)
+log('   Model:', GROQ_MODEL)
+log('   GROQ_URL:', GROQ_URL)
+log('   CHATWOOT_AUTH_MODE:', CHATWOOT_AUTH_MODE)
+log('   REPLY_VIA_API:', REPLY_VIA_API === '1' ? 'ON' : 'OFF')
 
-if (!GROQ_API_KEY) console.warn('⚠️ Falta GROQ_API_KEY');
+// === Dedupe por message.id con TTL ===
+const seen = new Map()
+const SEEN_TTL_MS = 5 * 60 * 1000
+setInterval(() => {
+  const now = Date.now()
+  for (const [k, v] of seen.entries()) if (now - v > SEEN_TTL_MS) seen.delete(k)
+}, 60 * 1000)
 
-// ===== dedupe simple en memoria =====
-const respondedMap = new Map(); // key -> timestamp
-const DEDUPE_TTL_MS = 2 * 60 * 1000; // 2 min
+// Helpers
+const isTruthy = v => v === 1 || v === '1' || v === true || v === 'true'
 
-function dedupeKeyFromPayload(b) {
-  // mensaje explícito
-  const mid = b?.message?.id || b?.id;
-  if (mid) return `mid:${mid}`;
-  // último mensaje de la conversación
-  const last = Array.isArray(b?.conversation?.messages)
-    ? b.conversation.messages[b.conversation.messages.length - 1]
-    : undefined;
-  if (last?.id) return `convLast:${b?.conversation?.id}:${last.id}`;
-  // fallback
-  return `conv:${b?.conversation?.id}:ts:${b?.created_at || Date.now()}`;
+function extractIncomingText(body) {
+  // Intenta varios campos típicos
+  return body?.message?.content
+      ?? body?.content
+      ?? body?.text
+      ?? body?.input
+      ?? ''
 }
 
-function hasRecentlyResponded(key) {
-  const now = Date.now();
-  for (const [k, ts] of respondedMap) {
-    if (now - ts > DEDUPE_TTL_MS) respondedMap.delete(k);
+function extractConversationId(body) {
+  return body?.conversation?.id
+      ?? body?.conversation_id
+      ?? body?.id
+      ?? null
+}
+
+function extractMessageId(body) {
+  return body?.message?.id ?? body?.id ?? null
+}
+
+function extractAccountId(body) {
+  return body?.account?.id ?? body?.account_id ?? 1
+}
+
+// POST a Chatwoot
+async function postToChatwoot({ accountId, conversationId, content }) {
+  let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
+  const headers = { 'Content-Type': 'application/json' }
+  if (CHATWOOT_AUTH_MODE === 'xheader') {
+    headers['X-Api-Access-Token'] = CHATWOOT_TOKEN
+  } else {
+    url += (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
   }
-  if (!key) return false;
-  const ts = respondedMap.get(key);
-  if (ts && now - ts < DEDUPE_TTL_MS) return true;
-  respondedMap.set(key, now);
-  return false;
+
+  return axios.post(url, {
+    content,
+    message_type: 'outgoing',
+    private: false
+  }, { headers, timeout: 15000 })
 }
 
-// ===== helpers =====
-function extractUserMessage(body) {
-  return (
-    body?.message?.content ||
-    body?.content ||
-    body?.text ||
-    body?.input ||
-    (Array.isArray(body?.conversation?.messages)
-      ? body.conversation.messages.at(-1)?.content
-      : '') ||
-    ''
-  );
-}
+// Rutas
+app.get('/', (_, res) => res.json({ ok: true, service: 'axioma-bot' }))
 
-function shouldReplyTo(body) {
-  const lastMsg = Array.isArray(body?.conversation?.messages)
-    ? body.conversation.messages[body.conversation.messages.length - 1]
-    : undefined;
-
-  const isIncoming =
-    body?.message_type === 'incoming' ||
-    body?.message?.message_type === 'incoming' ||
-    lastMsg?.message_type === 'incoming' ||
-    lastMsg?.message_type === 0;
-
-  const isPrivate =
-    body?.private === true ||
-    body?.message?.private === true ||
-    lastMsg?.private === true;
-
-  const senderType =
-    body?.sender?.type ||
-    body?.message?.sender_type ||
-    body?.sender_type ||
-    lastMsg?.sender_type;
-
-  const knownAgentTypes = ['agent', 'user', 'system'];
-  const isFromAgent =
-    senderType && knownAgentTypes.includes(String(senderType).toLowerCase());
-
-  const decision = Boolean(isIncoming && !isPrivate && !isFromAgent);
-
-  if (LOG_DECISIONS) {
-    console.log(
-      `[decision] incoming=${!!isIncoming} private=${!!isPrivate} senderType=${senderType ?? '[absent]'} => shouldReply=${decision}`
-    );
-  }
-  return decision;
-}
-
-// ===== endpoint de salud =====
-app.get('/', (_, res) => {
-  res.json({
-    ok: true,
-    model: MODEL,
-    groq_url: GROQ_URL,
-    reply_via_api: REPLY_VIA_API,
-  });
-});
-
-// ===== webhook principal =====
 app.post('/chat', async (req, res) => {
-  const reqId = Math.random().toString(36).slice(2, 10);
-  console.log(`[${new Date().toISOString()}] [${reqId}] ⇢ POST /chat from ${req.ip}`);
+  const reqId = nowId()
+  const ip = req.headers['x-real-ip'] || req.ip
+  log(`[${new Date().toISOString()}] [${reqId}] ⇢ POST /chat from ${ip}`)
 
-  if (LOG_BODY) {
-    console.log(`[${reqId}] ⇢ Headers:`, req.headers);
-    try {
-      console.log(`[${reqId}] ⇢ Body:`, JSON.stringify(req.body, null, 2));
-    } catch {}
+  if (isTruthy(LOG_BODY)) {
+    log(`[${reqId}] ⇢ Headers:`, JSON.stringify(req.headers, null, 2))
+    log(`[${reqId}] ⇢ Body:`, JSON.stringify(req.body, null, 2))
   }
 
-  const body = req.body;
+  // Solo procesar eventos de creación de mensaje entrante del contacto
+  const event = req.body?.event || ''
+  const isIncoming = (req.body?.message?.message_type === 0 || req.body?.message?.message_type === 'incoming')
+  const isContact = (req.body?.message?.sender_type || '').toLowerCase() === 'contact'
 
-  // Filtro: solo contestar a entrantes de cliente
-  if (!shouldReplyTo(body)) {
-    return res.status(200).json({ ok: true, skipped: true });
+  if (isTruthy(LOG_DECISIONS)) {
+    log(`[${reqId}] decision: event=${event} isIncoming=${isIncoming} isContact=${isContact}`)
   }
 
-  // Antiduplicados
-  const dkey = dedupeKeyFromPayload(body);
-  if (hasRecentlyResponded(dkey)) {
-    if (LOG_DECISIONS) console.log(`[${reqId}] ⛔ dedupe skip key=${dkey}`);
-    return res.status(200).json({ ok: true, deduped: true });
+  if (event && event !== 'message_created') {
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️  skip: event ${event}`)
+    return res.status(200).json({ ok: true, skipped: true })
+  }
+  if (!isIncoming || !isContact) {
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️  skip: not incoming contact`)
+    return res.status(200).json({ ok: true, skipped: true })
   }
 
-  const userMessage = extractUserMessage(body).trim();
+  // Dedupe
+  const msgId = extractMessageId(req.body)
+  if (msgId) {
+    if (seen.has(msgId)) {
+      if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️  duplicate message_id=${msgId}`)
+      return res.status(200).json({ ok: true, deduped: true })
+    }
+    seen.set(msgId, Date.now())
+  }
+
+  const userMessage = extractIncomingText(req.body)
   if (!userMessage) {
-    return res.status(200).json({
-      content: '❗️ No recibí ningún mensaje. ¿Puedes repetirlo?',
-      private: false,
-    });
+    log(`[${reqId}] ⚠️ Sin texto entrante`)
+    return res.status(200).json({ content: '¿Podrías repetirlo?', private: false })
   }
 
-  // Llamada a GROQ
-  console.log(`[${reqId}] ⇢ GROQ model=${MODEL} url=${GROQ_URL}`);
-  let botReply = '';
+  // Llama a Groq
   try {
-    const r = await axios.post(
-      GROQ_URL,
-      {
-        model: MODEL,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Eres el asistente de Axioma Creativa. Responde en español, cálido y claro, con 1–2 emojis máx. Sé conciso (3–4 frases) y cierra con una CTA.',
-          },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0.7,
-        max_tokens: 300,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json',
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⇢ GROQ model=${GROQ_MODEL} url=${GROQ_URL}`)
+    const g = await axios.post(GROQ_URL, {
+      model: GROQ_MODEL,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Eres un asistente alegre y amigable de Axioma Creativa. Hablas con emojis, frases cortas y tono cercano. Genera interés y guía a la acción.'
         },
-        timeout: 15000,
-      }
-    );
+        { role: 'user', content: userMessage }
+      ],
+      temperature: 0.8,
+      max_tokens: 300
+    }, {
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      timeout: 15000
+    })
 
-    if (LOG_GROQ_RESP) {
-      console.log(`[${reqId}] ⇠ GROQ:`, JSON.stringify(r.data, null, 2));
+    if (isTruthy(LOG_GROQ_RESP)) {
+      log(`[${reqId}] ⇠ GROQ:`, JSON.stringify(g.data, null, 2))
+    } else if (isTruthy(LOG_DECISIONS)) {
+      log(`[${reqId}] ⇠ GROQ status=${g.status}`)
     }
 
-    botReply = r?.data?.choices?.[0]?.message?.content?.trim() || '';
-    if (!botReply) botReply = '🤖 Aquí estoy, ¿puedes reformular tu pregunta?';
-    console.log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 140)}…`);
+    const botReply = g.data?.choices?.[0]?.message?.content?.trim()
+    if (!botReply) {
+      log(`[${reqId}] ⚠️ Respuesta vacía de GROQ`)
+      return res.status(200).json({ content: 'Ups, no pude responder ahora 😅', private: false })
+    }
+
+    log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 120)}${botReply.length > 120 ? '…' : ''}`)
+
+    // Respondemos al hook rápido
+    res.status(200).json({ content: botReply, private: false })
+
+    // Publicar en Chatwoot si está activado
+    if (isTruthy(REPLY_VIA_API)) {
+      const conversationId = extractConversationId(req.body)
+      const accountId = extractAccountId(req.body)
+
+      if (!conversationId) {
+        log(`[${reqId}] ⚠️ No hay conversation.id en payload → no envío a Chatwoot`)
+        return
+      }
+
+      try {
+        const urlPreview = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
+        log(`[${reqId}] ⇢ POST Chatwoot → ${urlPreview} (xheader=${CHATWOOT_AUTH_MODE === 'xheader'})`)
+
+        const resp = await postToChatwoot({
+          accountId,
+          conversationId,
+          content: botReply
+        })
+
+        log(`[${reqId}] ⇠ Chatwoot status=${resp.status} id=${resp.data?.id ?? resp.data?.message?.id ?? 'n/a'}`)
+      } catch (e) {
+        const status = e?.response?.status
+        const data = e?.response?.data
+        log(`[${reqId}] ❌ Chatwoot POST error status=${status} body=${JSON.stringify(data)}`)
+      }
+    }
+
   } catch (err) {
-    const status = err?.response?.status;
-    const data = err?.response?.data;
-    console.error(`[${reqId}] ❌ Error GROQ:`, status ? `status=${status}` : '', data || err.message);
-    if (data?.error?.code === 'rate_limit_exceeded') {
-      botReply = '⏳ Vamos con mucha carga. Intento responderte en unos segundos.';
-    } else {
-      botReply = '😔 Ha ocurrido un problema técnico. ¿Probamos de nuevo en un momento?';
-    }
+    const status = err?.response?.status
+    const data = err?.response?.data || err.message
+    log(`[${reqId}] ❌ GROQ error status=${status} body=${JSON.stringify(data)}`)
+    // Aun así devolvemos 200 al hook para que no reintente sin fin
+    return res.status(200).json({ content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo?', private: false })
   }
+})
 
-  // 1) Respuesta síncrona (lo que espera Chatwoot Agent Bot)
-  //    -> esto debería crear el mensaje en la conversación
-  const syncPayload = { content: botReply, private: false };
-  // No añadir otros campos para que Chatwoot no se líe
-  res.status(200).json(syncPayload);
-
-  // 2) (Opcional) Empujar también por API para asegurar entrega en el widget
-  if (REPLY_VIA_API && CHATWOOT_URL && CHATWOOT_TOKEN) {
-    try {
-      const accountId = body?.account?.id || 1;
-      const convId = body?.conversation?.id;
-      if (convId) {
-        await axios.post(
-          `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${convId}/messages`,
-          {
-            content: botReply,
-            message_type: 'outgoing',
-            private: false,
-          },
-          {
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Api-Access-Token': CHATWOOT_TOKEN,
-            },
-            timeout: 10000,
-          }
-        );
-        console.log(`[${reqId}] ✓ pushed via Chatwoot API conv=${convId}`);
-      } else {
-        console.warn(`[${reqId}] ⚠️ no convId para push API`);
-      }
-    } catch (err) {
-      console.error(
-        `[${reqId}] ❌ fallo push API Chatwoot:`,
-        err?.response?.status,
-        err?.response?.data || err.message
-      );
-    }
-  }
-});
-
-// ===== start =====
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Bot running on port ${PORT}`);
-  console.log('Model:', MODEL);
-  console.log('GROQ_URL:', GROQ_URL);
-  console.log('REPLY_VIA_API:', REPLY_VIA_API ? 'ON' : 'OFF');
-  console.log('LOG_BODY:', LOG_BODY ? 'ON' : 'OFF');
-  console.log('LOG_GROQ_RESP:', LOG_GROQ_RESP ? 'ON' : 'OFF');
-  console.log('LOG_DECISIONS:', LOG_DECISIONS ? 'ON' : 'OFF');
-});
+// Start
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => {})
