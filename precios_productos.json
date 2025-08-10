@@ -1,0 +1,103 @@
+{
+  "meta": {
+    "version": "2025-08-10",
+    "currency": "EUR",
+    "cta_url": "https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo",
+    "promo": {
+      "active": true,
+      "percent": 20,
+      "until": "2025-09-30",
+      "note": "Descuento del 20% durante agosto y septiembre en Web One-Page, Web Media y Web Completa."
+    }
+  },
+  "products": [
+    {
+      "id": "web_onepage",
+      "nombre": "Página Web One-Page",
+      "categoria": "web",
+      "descripcion": "Landing de una sola página con diseño responsive y contacto.",
+      "incluye": [
+        "Sección hero, presentación, servicios, contacto",
+        "1 cuenta de correo corporativo",
+        "SEO básico y Google Analytics"
+      ],
+      "precio": { "min": 290, "max": 490, "unidad": "proyecto" },
+      "plazo_dias": "3-5",
+      "promo_aplicable": true
+    },
+    {
+      "id": "web_media",
+      "nombre": "Página Web Media",
+      "categoria": "web",
+      "descripcion": "Web de 3 páginas con FAQ, calendario y correo corporativo.",
+      "incluye": [
+        "3 páginas: Inicio, Servicios, Contacto",
+        "Sección FAQ",
+        "Calendario de reservas",
+        "1 cuenta de correo corporativo",
+        "SEO básico"
+      ],
+      "precio": { "min": 490, "max": 790, "unidad": "proyecto" },
+      "plazo_dias": "5-8",
+      "promo_aplicable": true
+    },
+    {
+      "id": "web_completa",
+      "nombre": "Página Web Completa",
+      "categoria": "web",
+      "descripcion": "Sitio completo con imágenes y textos optimizados SEO.",
+      "incluye": [
+        "Diseño personalizado",
+        "Imágenes optimizadas",
+        "Textos adaptados para SEO",
+        "Integración con redes sociales",
+        "1 cuenta de correo corporativo"
+      ],
+      "precio": { "min": 790, "max": 1290, "unidad": "proyecto" },
+      "plazo_dias": "8-15",
+      "promo_aplicable": true
+    },
+    {
+      "id": "edicion_videos",
+      "nombre": "Edición de Videos",
+      "categoria": "multimedia",
+      "descripcion": "Edición profesional de videos para redes o web.",
+      "incluye": [
+        "Cortes y montaje",
+        "Transiciones y efectos",
+        "Subtítulos y música libre de derechos"
+      ],
+      "precio": { "min": 80, "max": 250, "unidad": "video" },
+      "plazo_dias": "2-5",
+      "promo_aplicable": false
+    },
+    {
+      "id": "capacitacion_ia",
+      "nombre": "Capacitación en Herramientas IA",
+      "categoria": "capacitacion",
+      "descripcion": "Formación práctica en HeyGen, ElevenLabs, ChatGPT y otras.",
+      "incluye": [
+        "Sesión en vivo (60–90 min)",
+        "Guías rápidas de uso",
+        "Casos prácticos adaptados"
+      ],
+      "precio": { "min": 120, "max": 240, "unidad": "sesion" },
+      "plazo_dias": "1-7",
+      "promo_aplicable": false
+    },
+    {
+      "id": "correo_corporativo",
+      "nombre": "Correo Corporativo",
+      "categoria": "infraestructura",
+      "descripcion": "Configuración de correo profesional con tu dominio.",
+      "incluye": [
+        "Configuración de buzones",
+        "Protección SPF/DKIM/DMARC",
+        "Alias y redirecciones"
+      ],
+      "precio": { "min": 60, "max": 180, "unidad": "proyecto" },
+      "plazo_dias": "1-3",
+      "promo_aplicable": false
+    }
+  ]
+}
