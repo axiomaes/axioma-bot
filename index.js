@@ -73,7 +73,7 @@ async function postToChatwoot({ accountId, conversationId, content }) {
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
   const headers = { 'Content-Type': 'application/json' }
   if (CHATWOOT_AUTH_MODE === 'xheader') {
-    headers['X-Api-Access-Token'] = CHATWOOT_TOKEN
+    headers['api_access_token'] = CHATWOOT_TOKEN // ← Header correcto para tu instancia
   } else {
     url += (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
   }
@@ -100,7 +100,7 @@ app.post('/chat', async (req, res) => {
 
   const event = req.body?.event || ''
 
-  // MODIFICADO para aceptar 0, "0" o "incoming"
+  // Acepta 0, "0" o "incoming"
   const type = req.body?.message?.message_type
   const isIncoming = type === 0 || type === '0' || String(type).toLowerCase() === 'incoming'
 
