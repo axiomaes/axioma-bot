@@ -8,7 +8,6 @@ app.use(express.json({ limit: '1mb' }))
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  // añadimos también 'api_access_token' por si lo llamas desde navegador
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token', 'api_access_token'],
 }))
 
@@ -20,10 +19,11 @@ const {
   CHATWOOT_URL = '',
   CHATWOOT_TOKEN = '',
   CHATWOOT_AUTH_MODE = 'xheader', // xheader | query
-  REPLY_VIA_API = '0',
+  REPLY_VIA_API = '1',
   LOG_BODY = '0',
   LOG_GROQ_RESP = '0',
   LOG_DECISIONS = '0',
+  CTA_URL = 'https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo',
 } = process.env
 
 function log(...args) { console.log(...args) }
@@ -34,6 +34,7 @@ log('   Model:', GROQ_MODEL)
 log('   GROQ_URL:', GROQ_URL)
 log('   CHATWOOT_AUTH_MODE:', CHATWOOT_AUTH_MODE)
 log('   REPLY_VIA_API:', REPLY_VIA_API === '1' ? 'ON' : 'OFF')
+log('   CTA_URL:', CTA_URL)
 
 // === Dedupe por message.id con TTL ===
 const seen = new Map()
@@ -54,24 +55,45 @@ function extractIncomingText(body) {
       ?? body?.input
       ?? ''
 }
-
 function extractConversationId(body) {
   return body?.conversation?.id
       ?? body?.conversation_id
       ?? body?.id
       ?? null
 }
-
 function extractMessageId(body) {
   return body?.message?.id
       ?? body?.id
       ?? null
 }
-
 function extractAccountId(body) {
   return body?.account?.id
       ?? body?.account_id
       ?? 1
+}
+
+// ==== Heurística simple de intención de precio ====
+const PRICE_KEYWORDS = [
+  'precio', 'precios', 'tarifa', 'tarifas', 'cuánto', 'cuanto', 'coste', 'costo', 'vale', 'vale?', 'presupuesto'
+]
+function isPriceQuery(text) {
+  const t = (text || '').toLowerCase()
+  return PRICE_KEYWORDS.some(k => t.includes(k))
+}
+function priceReply() {
+  return [
+    '💡 Te cuento precios orientativos (accesibles) para empezar:',
+    '• Sesión de diagnóstico 30 min: **gratis**.',
+    '• Asesoría 60 min para tu caso: **49 €**.',
+    '• Automatización ligera (formularios → sheets/email): **desde 120–240 €**.',
+    '• Paquete mensual de contenidos asistidos por IA: **desde 190 €/mes**.',
+    '',
+    `¿Te va bien agendar una cita de descubrimiento? Aquí puedes elegir hora: ${CTA_URL}`
+  ].join('\n')
+}
+function ensureCTA(text) {
+  const hasLink = (text || '').includes(CTA_URL)
+  return hasLink ? text : `${text}\n\n📅 Agenda aquí: ${CTA_URL}`
 }
 
 // POST a Chatwoot
@@ -112,19 +134,15 @@ app.post('/chat', async (req, res) => {
   const typeRaw =
     req.body?.message?.message_type ??
     req.body?.message_type
-
   const senderTypeRaw =
     req.body?.message?.sender_type ??
     req.body?.sender_type ??
     ''
-
   const typeStr = String(typeRaw).toLowerCase()
   const isIncoming =
     typeRaw === 0 ||
     typeRaw === '0' ||
     typeStr === 'incoming' // 0 | "0" | "incoming"
-
-  // Si no llega sender_type, asumimos contact cuando sea incoming
   const senderType = String(senderTypeRaw).toLowerCase()
   const isContact = senderType ? senderType === 'contact' : isIncoming
 
@@ -157,7 +175,29 @@ app.post('/chat', async (req, res) => {
     return res.status(200).json({ content: '¿Podrías repetirlo?', private: false })
   }
 
-  // Llama a Groq
+  // Regla: si preguntan por precios, respondemos plantilla accesible + CTA
+  if (isPriceQuery(userMessage)) {
+    const reply = priceReply()
+    res.status(200).json({ content: reply, private: false })
+
+    if (isTruthy(REPLY_VIA_API)) {
+      try {
+        const conversationId = extractConversationId(req.body)
+        const accountId = extractAccountId(req.body)
+        if (conversationId) {
+          const resp = await postToChatwoot({ accountId, conversationId, content: reply })
+          log(`[${reqId}] ⇠ Chatwoot (precio) status=${resp.status} id=${resp.data?.id ?? resp.data?.message?.id ?? 'n/a'}`)
+        } else {
+          log(`[${reqId}] ⚠️ sin conversation.id en payload (precio)`)
+        }
+      } catch (e) {
+        log(`[${reqId}] ❌ Chatwoot POST (precio) error status=${e?.response?.status} body=${JSON.stringify(e?.response?.data)}`)
+      }
+    }
+    return
+  }
+
+  // Llama a Groq para el resto
   try {
     if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⇢ GROQ model=${GROQ_MODEL} url=${GROQ_URL}`)
     const g = await axios.post(GROQ_URL, {
@@ -166,12 +206,18 @@ app.post('/chat', async (req, res) => {
         {
           role: 'system',
           content:
-            'Eres un asistente alegre y amigable de Axioma Creativa. Hablas con emojis, frases cortas y tono cercano. Genera interés y guía a la acción.'
+            [
+              'Eres el asistente de Axioma Creativa (Madrid). Tono: cercano, profesional y proactivo, con emojis moderados.',
+              'Objetivo: entender necesidad, dar una respuesta clara y una siguiente acción.',
+              'Si el usuario pide precios o presupuesto: DA rangos ACCESIBLES en EUR (49€, 120–240€, 190€/mes) y sugiere opciones.',
+              `Cierra SIEMPRE con una invitación a agendar en: ${CTA_URL}`,
+              'Evita respuestas largas, usa frases cortas y listas. No inventes datos.'
+            ].join(' ')
         },
         { role: 'user', content: userMessage }
       ],
-      temperature: 0.8,
-      max_tokens: 300
+      temperature: 0.6,
+      max_tokens: 320
     }, {
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
       timeout: 15000
@@ -183,42 +229,31 @@ app.post('/chat', async (req, res) => {
       log(`[${reqId}] ⇠ GROQ status=${g.status}`)
     }
 
-    const botReply = g.data?.choices?.[0]?.message?.content?.trim()
+    let botReply = g.data?.choices?.[0]?.message?.content?.trim()
     if (!botReply) {
       log(`[${reqId}] ⚠️ Respuesta vacía de GROQ`)
-      return res.status(200).json({ content: 'Ups, no pude responder ahora 😅', private: false })
+      botReply = 'Puedo ayudarte con ideas y automaciones útiles. ¿Te va bien una llamada rápida?\n\n📅 Agenda aquí: ' + CTA_URL
+    } else {
+      botReply = ensureCTA(botReply)
     }
 
-    log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 120)}${botReply.length > 120 ? '…' : ''}`)
-
-    // Responder al webhook rápido
+    log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 140)}${botReply.length > 140 ? '…' : ''}`)
     res.status(200).json({ content: botReply, private: false })
 
-    // Publicar en Chatwoot si está activado
     if (isTruthy(REPLY_VIA_API)) {
       const conversationId = extractConversationId(req.body)
       const accountId = extractAccountId(req.body)
-
       if (!conversationId) {
         log(`[${reqId}] ⚠️ No hay conversation.id en payload → no envío a Chatwoot`)
-        return
-      }
-
-      try {
-        const urlPreview = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
-        log(`[${reqId}] ⇢ POST Chatwoot → ${urlPreview} (xheader=${CHATWOOT_AUTH_MODE === 'xheader'})`)
-
-        const resp = await postToChatwoot({
-          accountId,
-          conversationId,
-          content: botReply
-        })
-
-        log(`[${reqId}] ⇠ Chatwoot status=${resp.status} id=${resp.data?.id ?? resp.data?.message?.id ?? 'n/a'}`)
-      } catch (e) {
-        const status = e?.response?.status
-        const data = e?.response?.data
-        log(`[${reqId}] ❌ Chatwoot POST error status=${status} body=${JSON.stringify(data)}`)
+      } else {
+        try {
+          const resp = await postToChatwoot({ accountId, conversationId, content: botReply })
+          log(`[${reqId}] ⇠ Chatwoot status=${resp.status} id=${resp.data?.id ?? resp.data?.message?.id ?? 'n/a'}`)
+        } catch (e) {
+          const status = e?.response?.status
+          const data = e?.response?.data
+          log(`[${reqId}] ❌ Chatwoot POST error status=${status} body=${JSON.stringify(data)}`)
+        }
       }
     }
 
@@ -226,8 +261,10 @@ app.post('/chat', async (req, res) => {
     const status = err?.response?.status
     const data = err?.response?.data || err.message
     log(`[${reqId}] ❌ GROQ error status=${status} body=${JSON.stringify(data)}`)
-    // Devolvemos 200 para evitar reintentos infinitos del webhook
-    return res.status(200).json({ content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo?', private: false })
+    return res.status(200).json({
+      content: ensureCTA('Ahora mismo estoy saturado 😅, ¿probamos de nuevo en un momento?'),
+      private: false
+    })
   }
 })
 
