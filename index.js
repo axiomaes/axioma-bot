@@ -16,13 +16,10 @@ const {
   GROQ_API_KEY,
   GROQ_MODEL = 'llama3-70b-8192',
   GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions',
-
   CHATWOOT_URL = '',
   CHATWOOT_TOKEN = '',
-  CHATWOOT_AUTH_MODE = 'xheader',     // xheader | query
-  CHATWOOT_INBOX_ID = '',             // ej: 1
-  CHATWOOT_AUTOCREATE = '0',          // 0 = no crear conv; 1 = crear si no viene conversation.id
-
+  CHATWOOT_AUTH_MODE = 'xheader', // xheader | query
+  CHATWOOT_INBOX_ID = '',
   REPLY_VIA_API = '0',
   LOG_BODY = '0',
   LOG_GROQ_RESP = '0',
@@ -60,7 +57,6 @@ log('   Model:', GROQ_MODEL)
 log('   GROQ_URL:', GROQ_URL)
 log('   CHATWOOT_AUTH_MODE:', CHATWOOT_AUTH_MODE)
 log('   REPLY_VIA_API:', REPLY_VIA_API === '1' ? 'ON' : 'OFF')
-log('   CHATWOOT_AUTOCREATE:', isTruthy(CHATWOOT_AUTOCREATE) ? 'ON' : 'OFF')
 
 // === Dedupe por message.id con TTL ===
 const seen = new Map()
@@ -102,21 +98,16 @@ function extractSender(body) {
   }
 }
 
-// === Chatwoot helpers ===
+// POST a Chatwoot
 function cwHeaders() {
   const headers = { 'Content-Type': 'application/json' }
-  if (CHATWOOT_AUTH_MODE === 'xheader') {
-    headers['api_access_token'] = CHATWOOT_TOKEN
-  }
+  if (CHATWOOT_AUTH_MODE === 'xheader') headers['api_access_token'] = CHATWOOT_TOKEN
   return headers
 }
-
 function withToken(url) {
   if (CHATWOOT_AUTH_MODE === 'xheader') return url
   return url + (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
 }
-
-// Postea mensaje a conversación existente
 async function postToChatwoot({ accountId, conversationId, content }) {
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
   url = withToken(url)
@@ -127,8 +118,7 @@ async function postToChatwoot({ accountId, conversationId, content }) {
   }, { headers: cwHeaders(), timeout: 15000 })
 }
 
-// Crea contacto y conversación (para integraciones SIN widget)
-// Importante: flujo compatible con Website Inbox
+// Crear contacto y conversación
 async function createContactAndConversation(accountId, name, email, phone) {
   // 1) Crear contacto (sin inbox_id)
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/contacts`
@@ -138,7 +128,6 @@ async function createContactAndConversation(accountId, name, email, phone) {
     email: email || undefined,
     phone_number: phone || undefined
   }, { headers: cwHeaders(), timeout: 15000 })
-
   const contactId = contactResp.data?.id || contactResp.data?.contact?.id
   if (!contactId) throw new Error('No se pudo obtener contact.id')
 
@@ -150,150 +139,123 @@ async function createContactAndConversation(accountId, name, email, phone) {
     contact_id: Number(contactId),
     status: 'open'
   }, { headers: cwHeaders(), timeout: 15000 })
-
   const conversationId = convResp.data?.id || convResp.data?.conversation?.id
-  if (!conversationId) {
-    const body = JSON.stringify(convResp.data)
-    throw new Error('No se pudo obtener conversation.id: ' + body)
-  }
+  if (!conversationId) throw new Error('No se pudo obtener conversation.id')
   return conversationId
 }
 
 // === Rutas ===
 app.get('/', (_, res) => res.json({ ok: true, service: 'axioma-bot' }))
 
+// === BLOQUE /chat ACTUALIZADO (manteniendo el resto igual) ===
 app.post('/chat', async (req, res) => {
-  const reqId = nowId()
-  const ip = req.headers['x-real-ip'] || req.ip
-  log(`[${new Date().toISOString()}] [${reqId}] ⇢ POST /chat from ${ip}`)
+  const reqId = nowId();
+  log(`\n[${reqId}] === Nuevo evento de Chatwoot ===`);
 
+  // 1) Validación básica
+  if (!req.body || !req.body.event) {
+    log(`[${reqId}] ❌ Solicitud inválida sin body o evento`);
+    return res.status(400).json({ error: 'Solicitud inválida' });
+  }
+
+  // 2) Log completo (opcional)
   if (isTruthy(LOG_BODY)) {
-    log(`[${reqId}] ⇢ Headers:`, JSON.stringify(req.headers, null, 2))
-    log(`[${reqId}] ⇢ Body:`, JSON.stringify(req.body, null, 2))
+    log(`[${reqId}] Cuerpo recibido:`, JSON.stringify(req.body, null, 2));
   }
 
-  const event = req.body?.event || ''
-  const typeRaw = req.body?.message?.message_type ?? req.body?.message_type
-  const senderTypeRaw = req.body?.message?.sender_type ?? req.body?.sender_type ?? ''
-  const typeStr = String(typeRaw).toLowerCase()
-  const isIncoming = typeRaw === 0 || typeRaw === '0' || typeStr === 'incoming'
-  const senderType = String(senderTypeRaw).toLowerCase()
-  const isContact = senderType ? senderType === 'contact' : isIncoming
-
-  if (isTruthy(LOG_DECISIONS)) {
-    log(`[${reqId}] decision: event=${event} isIncoming=${isIncoming} isContact=${isContact}`)
+  // 3) Solo procesamos creación de mensaje
+  const event = req.body.event;
+  if (event !== 'message_created') {
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ Evento no manejado: ${event}`);
+    return res.status(200).json({ ok: true, skipped: true });
   }
 
-  // Sólo procesamos "mensaje creado" desde contacto
-  if (event && event !== 'message_created') {
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ skip: event ${event}`)
-    return res.status(200).json({ ok: true, skipped: true })
-  }
+  // 4) Verificar que sea entrante de contacto
+  const msg = req.body.message || {};
+  const typeRaw = msg.message_type ?? req.body.message_type;
+  const senderTypeRaw = msg.sender_type ?? req.body.sender_type ?? '';
+  const isIncoming = typeRaw === 'incoming' || typeRaw === 0 || String(typeRaw).toLowerCase() === 'incoming';
+  const isContact = String(senderTypeRaw).toLowerCase() === 'contact' || isIncoming;
+
   if (!isIncoming || !isContact) {
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ skip: not incoming contact`)
-    return res.status(200).json({ ok: true, skipped: true })
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ No es mensaje entrante de contacto`);
+    return res.status(200).json({ ok: true, skipped: true });
   }
 
-  // Dedupe
-  const msgId = extractMessageId(req.body)
+  // 5) Dedupe
+  const msgId = extractMessageId(req.body);
   if (msgId) {
     if (seen.has(msgId)) {
-      if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ duplicate message_id=${msgId}`)
-      return res.status(200).json({ ok: true, deduped: true })
+      if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ Duplicado: message_id=${msgId}`);
+      return res.status(200).json({ ok: true, deduped: true });
     }
-    seen.set(msgId, Date.now())
+    seen.set(msgId, Date.now());
   }
 
-  const userMessage = extractIncomingText(req.body)
+  // 6) Datos esenciales
+  let accountId = extractAccountId(req.body);
+  let conversationId = extractConversationId(req.body);
+  const userMessage = extractIncomingText(req.body);
   if (!userMessage) {
-    log(`[${reqId}] ⚠️ Sin texto entrante`)
-    return res.status(200).json({ content: '¿Podrías repetirlo?', private: false })
+    log(`[${reqId}] ⚠️ Sin texto entrante`);
+    return res.status(200).json({ content: '¿Podrías repetirlo?', private: false });
   }
 
-  // --- Respuesta especial para precios (sin IA) ---
+  // 7) Si no hay conversación, crearla (para garantizar que aparezca en el dashboard)
+  if (!conversationId && isTruthy(REPLY_VIA_API)) {
+    try {
+      const s = extractSender(req.body);
+      if (!s.email) s.email = `sin-email-${Date.now()}@axioma-creativa.local`;
+      conversationId = await createContactAndConversation(accountId, s.name, s.email, s.phone);
+      log(`[${reqId}] 🆕 Conversación creada: ${conversationId}`);
+    } catch (err) {
+      const st = err?.response?.status;
+      const body = err?.response?.data;
+      log(`[${reqId}] ❌ Error creando conversación status=${st} body=${JSON.stringify(body)} err=${err.message}`);
+      // Aun así respondemos al webhook para evitar reintentos
+    }
+  }
+
+  // 8) Respuesta especial para precios (sin IA)
   if (isPriceIntent(userMessage)) {
     const content =
 `Gracias por tu interés. Cada proyecto es diferente y requiere entender objetivos, alcance y tiempos.
 Para darte un presupuesto serio, mejor agendamos una breve videollamada.
 📅 Reserva aquí: ${CTA_URL}
-¿Te viene bien esta semana?`
+¿Te viene bien esta semana?`;
 
-    // Responder al webhook
-    res.status(200).json({ content, private: false })
+    // Respuesta al webhook
+    res.status(200).json({ content, private: false });
 
-    // Intentar publicar en Chatwoot sólo si tenemos conversationId, o si está permitido auto-crear
-    if (isTruthy(REPLY_VIA_API)) {
-      const accountId = extractAccountId(req.body)
-      let conversationId = extractConversationId(req.body)
-
-      if (!conversationId) {
-        if (isTruthy(CHATWOOT_AUTOCREATE)) {
-          try {
-            const sender = extractSender(req.body)
-            if (!sender.email) sender.email = `sin-email-${Date.now()}@axioma-creativa.local`
-            conversationId = await createContactAndConversation(accountId, sender.name, sender.email, sender.phone)
-            log(`[${reqId}] ✅ Conversación creada (autocreate) id=${conversationId}`)
-          } catch (e) {
-            const st = e?.response?.status
-            const body = e?.response?.data
-            log(`[${reqId}] ❌ No se pudo autocrear conv status=${st} body=${JSON.stringify(body)} err=${e.message}`)
-          }
-        } else {
-          log(`[${reqId}] ⚠️ No hay conversation.id (widget debe crearla) — AUTOCREATE=OFF`)
-        }
-      }
-
-      if (conversationId) {
-        try { await postToChatwoot({ accountId, conversationId, content }) }
-        catch (e) {
-          const st = e?.response?.status
-          const body = e?.response?.data
-          log(`[${reqId}] ❌ Chatwoot POST error status=${st} body=${JSON.stringify(body)}`)
-        }
+    // Publicar en Chatwoot si tenemos conversación
+    if (isTruthy(REPLY_VIA_API) && conversationId) {
+      try { await postToChatwoot({ accountId, conversationId, content }); }
+      catch (e) {
+        const st = e?.response?.status;
+        const body = e?.response?.data;
+        log(`[${reqId}] ❌ Chatwoot POST error status=${st} body=${JSON.stringify(body)}`);
       }
     }
 
-    // Guardar en memoria
-    const cid = extractConversationId(req.body)
-    if (cid) {
-      const arr = hist.get(cid) || []
-      arr.push({ role: 'user', content: userMessage, ts: Date.now() })
-      arr.push({ role: 'assistant', content, ts: Date.now() })
-      hist.set(cid, arr.slice(-HISTORY_MAX))
+    // Historial
+    if (conversationId) {
+      const arr = hist.get(conversationId) || [];
+      arr.push({ role: 'user', content: userMessage, ts: Date.now() });
+      arr.push({ role: 'assistant', content, ts: Date.now() });
+      hist.set(conversationId, arr.slice(-HISTORY_MAX));
     }
-    return
+    return;
   }
 
-  // === Llamada a GROQ (con historial) ===
+  // 9) Procesamiento normal con GROQ (con historial)
   try {
-    const accountId = extractAccountId(req.body)
-    let cid = extractConversationId(req.body)
-
-    // 👉 IMPORTANTÍSIMO:
-    // Si no hay conversationId, por defecto NO autocreamos para no interferir con el widget.
-    // Sólo autocreamos si CHATWOOT_AUTOCREATE=1 (p.ej. para integraciones externas sin widget).
-    if (!cid && isTruthy(REPLY_VIA_API) && isTruthy(CHATWOOT_AUTOCREATE)) {
-      try {
-        const sender = extractSender(req.body)
-        if (!sender.email) sender.email = `sin-email-${Date.now()}@axioma-creativa.local`
-        cid = await createContactAndConversation(accountId, sender.name, sender.email, sender.phone)
-        log(`[${reqId}] ✅ Conversación creada (autocreate) id=${cid}`)
-      } catch (e) {
-        const st = e?.response?.status
-        const body = e?.response?.data
-        log(`[${reqId}] ❌ No se pudo autocrear conv status=${st} body=${JSON.stringify(body)} err=${e.message}`)
-      }
-    } else if (!cid) {
-      log(`[${reqId}] ⚠️ No hay conversation.id (widget debe crearla) — AUTOCREATE=OFF`)
-    }
-
-    const prior = cid ? (hist.get(cid) || []) : []
+    const prior = conversationId ? (hist.get(conversationId) || []) : [];
     const messages = [
       {
         role: 'system',
         content:
 `Eres un asistente profesional de Axioma Creativa (Madrid).
-Estilo: claro, conciso y cercano. Servicios: soluciones con IA para pymes, páginas web, bots, procesos y automatizaciones, edición de vídeo y avatares.
+Estilo: claro, conciso y cercano. Nuestros servicios van enfocados a soluciones IA para pequeñas y medianas empresas , paginas web , bot , procesos , automatizaciones, edicion de videos , avatares
 Si preguntan por precios, explica que cada caso requiere entender objetivos, alcance y plazos; invita a agendar videollamada en ${CTA_URL}.
 Mantén coherencia con el contexto previo.`
       },
@@ -322,21 +284,21 @@ Mantén coherencia con el contexto previo.`
     if (!botReply) botReply = `📅 Agenda aquí: ${CTA_URL}`
     if (!botReply.includes(CTA_URL)) botReply += `\n\n📅 ¿Agendamos? ${CTA_URL}`
 
-    // Guardar historial
-    if (cid) {
-      const arr = hist.get(cid) || []
+    // Historial
+    if (conversationId) {
+      const arr = hist.get(conversationId) || []
       arr.push({ role: 'user', content: userMessage, ts: Date.now() })
       arr.push({ role: 'assistant', content: botReply, ts: Date.now() })
-      hist.set(cid, arr.slice(-HISTORY_MAX))
+      hist.set(conversationId, arr.slice(-HISTORY_MAX))
     }
 
     // Responder al webhook
     res.status(200).json({ content: botReply, private: false })
 
     // Publicar en Chatwoot si corresponde
-    if (isTruthy(REPLY_VIA_API) && cid) {
+    if (isTruthy(REPLY_VIA_API) && conversationId) {
       try {
-        const resp = await postToChatwoot({ accountId, conversationId: cid, content: botReply })
+        const resp = await postToChatwoot({ accountId, conversationId, content: botReply })
         log(`[${reqId}] ⇠ Chatwoot status=${resp.status}`)
       } catch (e) {
         const st = e?.response?.status
