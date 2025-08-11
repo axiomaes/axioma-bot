@@ -16,10 +16,13 @@ const {
   GROQ_API_KEY,
   GROQ_MODEL = 'llama3-70b-8192',
   GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions',
+
   CHATWOOT_URL = '',
   CHATWOOT_TOKEN = '',
-  CHATWOOT_AUTH_MODE = 'xheader', // xheader | query
-  CHATWOOT_INBOX_ID = '',
+  CHATWOOT_AUTH_MODE = 'xheader',     // xheader | query
+  CHATWOOT_INBOX_ID = '',             // ej: 1
+  CHATWOOT_AUTOCREATE = '0',          // 0 = no crear conv; 1 = crear si no viene conversation.id
+
   REPLY_VIA_API = '0',
   LOG_BODY = '0',
   LOG_GROQ_RESP = '0',
@@ -57,6 +60,7 @@ log('   Model:', GROQ_MODEL)
 log('   GROQ_URL:', GROQ_URL)
 log('   CHATWOOT_AUTH_MODE:', CHATWOOT_AUTH_MODE)
 log('   REPLY_VIA_API:', REPLY_VIA_API === '1' ? 'ON' : 'OFF')
+log('   CHATWOOT_AUTOCREATE:', isTruthy(CHATWOOT_AUTOCREATE) ? 'ON' : 'OFF')
 
 // === Dedupe por message.id con TTL ===
 const seen = new Map()
@@ -90,52 +94,68 @@ function extractAccountId(body) {
       ?? body?.account_id
       ?? 1
 }
+function extractSender(body) {
+  return {
+    name: body?.message?.sender?.name || 'Visitante',
+    email: body?.message?.sender?.email || null,
+    phone: body?.message?.sender?.phone_number || null,
+  }
+}
 
-// POST a Chatwoot
-async function postToChatwoot({ accountId, conversationId, content }) {
-  let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
+// === Chatwoot helpers ===
+function cwHeaders() {
   const headers = { 'Content-Type': 'application/json' }
   if (CHATWOOT_AUTH_MODE === 'xheader') {
     headers['api_access_token'] = CHATWOOT_TOKEN
-  } else {
-    url += (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
   }
+  return headers
+}
+
+function withToken(url) {
+  if (CHATWOOT_AUTH_MODE === 'xheader') return url
+  return url + (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
+}
+
+// Postea mensaje a conversación existente
+async function postToChatwoot({ accountId, conversationId, content }) {
+  let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
+  url = withToken(url)
   return axios.post(url, {
     content,
     message_type: 'outgoing',
     private: false
-  }, { headers, timeout: 15000 })
+  }, { headers: cwHeaders(), timeout: 15000 })
 }
 
-// Crear contacto y conversación
+// Crea contacto y conversación (para integraciones SIN widget)
+// Importante: flujo compatible con Website Inbox
 async function createContactAndConversation(accountId, name, email, phone) {
+  // 1) Crear contacto (sin inbox_id)
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/contacts`
-  const headers = { 'Content-Type': 'application/json' }
-  if (CHATWOOT_AUTH_MODE === 'xheader') {
-    headers['api_access_token'] = CHATWOOT_TOKEN
-  } else {
-    url += `?api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
-  }
+  url = withToken(url)
   const contactResp = await axios.post(url, {
     name,
-    email,
-    phone_number: phone,
-    inbox_id: CHATWOOT_INBOX_ID
-  }, { headers })
-  const contactId = contactResp.data?.id
+    email: email || undefined,
+    phone_number: phone || undefined
+  }, { headers: cwHeaders(), timeout: 15000 })
+
+  const contactId = contactResp.data?.id || contactResp.data?.contact?.id
   if (!contactId) throw new Error('No se pudo obtener contact.id')
 
+  // 2) Crear conversación con contact_id + inbox_id
   url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations`
-  if (CHATWOOT_AUTH_MODE !== 'xheader') {
-    url += `?api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
-  }
+  url = withToken(url)
   const convResp = await axios.post(url, {
-    inbox_id: CHATWOOT_INBOX_ID,
-    contact_id: contactId,
+    inbox_id: Number(CHATWOOT_INBOX_ID),
+    contact_id: Number(contactId),
     status: 'open'
-  }, { headers })
-  const conversationId = convResp.data?.id
-  if (!conversationId) throw new Error('No se pudo obtener conversation.id')
+  }, { headers: cwHeaders(), timeout: 15000 })
+
+  const conversationId = convResp.data?.id || convResp.data?.conversation?.id
+  if (!conversationId) {
+    const body = JSON.stringify(convResp.data)
+    throw new Error('No se pudo obtener conversation.id: ' + body)
+  }
   return conversationId
 }
 
@@ -164,6 +184,7 @@ app.post('/chat', async (req, res) => {
     log(`[${reqId}] decision: event=${event} isIncoming=${isIncoming} isContact=${isContact}`)
   }
 
+  // Sólo procesamos "mensaje creado" desde contacto
   if (event && event !== 'message_created') {
     if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ skip: event ${event}`)
     return res.status(200).json({ ok: true, skipped: true })
@@ -189,33 +210,50 @@ app.post('/chat', async (req, res) => {
     return res.status(200).json({ content: '¿Podrías repetirlo?', private: false })
   }
 
-  // --- Respuesta especial para precios ---
+  // --- Respuesta especial para precios (sin IA) ---
   if (isPriceIntent(userMessage)) {
     const content =
 `Gracias por tu interés. Cada proyecto es diferente y requiere entender objetivos, alcance y tiempos.
 Para darte un presupuesto serio, mejor agendamos una breve videollamada.
 📅 Reserva aquí: ${CTA_URL}
 ¿Te viene bien esta semana?`
+
+    // Responder al webhook
     res.status(200).json({ content, private: false })
 
+    // Intentar publicar en Chatwoot sólo si tenemos conversationId, o si está permitido auto-crear
     if (isTruthy(REPLY_VIA_API)) {
-      let conversationId = extractConversationId(req.body)
       const accountId = extractAccountId(req.body)
+      let conversationId = extractConversationId(req.body)
+
       if (!conversationId) {
-        try {
-          const name = req.body?.message?.sender?.name || 'Visitante'
-          let email = req.body?.message?.sender?.email
-          if (!email) email = `sin-email-${Date.now()}@axioma-creativa.local`
-          const phone = req.body?.message?.sender?.phone_number || ''
-          conversationId = await createContactAndConversation(accountId, name, email, phone)
-        } catch (e) {
-          log(`[${reqId}] ❌ Error creando conversación: ${e.message}`)
+        if (isTruthy(CHATWOOT_AUTOCREATE)) {
+          try {
+            const sender = extractSender(req.body)
+            if (!sender.email) sender.email = `sin-email-${Date.now()}@axioma-creativa.local`
+            conversationId = await createContactAndConversation(accountId, sender.name, sender.email, sender.phone)
+            log(`[${reqId}] ✅ Conversación creada (autocreate) id=${conversationId}`)
+          } catch (e) {
+            const st = e?.response?.status
+            const body = e?.response?.data
+            log(`[${reqId}] ❌ No se pudo autocrear conv status=${st} body=${JSON.stringify(body)} err=${e.message}`)
+          }
+        } else {
+          log(`[${reqId}] ⚠️ No hay conversation.id (widget debe crearla) — AUTOCREATE=OFF`)
         }
       }
+
       if (conversationId) {
-        try { await postToChatwoot({ accountId, conversationId, content }) } catch {}
+        try { await postToChatwoot({ accountId, conversationId, content }) }
+        catch (e) {
+          const st = e?.response?.status
+          const body = e?.response?.data
+          log(`[${reqId}] ❌ Chatwoot POST error status=${st} body=${JSON.stringify(body)}`)
+        }
       }
     }
+
+    // Guardar en memoria
     const cid = extractConversationId(req.body)
     if (cid) {
       const arr = hist.get(cid) || []
@@ -226,34 +264,44 @@ Para darte un presupuesto serio, mejor agendamos una breve videollamada.
     return
   }
 
-  // === Llamada a GROQ ===
+  // === Llamada a GROQ (con historial) ===
   try {
-    let cid = extractConversationId(req.body)
     const accountId = extractAccountId(req.body)
-    if (!cid && isTruthy(REPLY_VIA_API)) {
+    let cid = extractConversationId(req.body)
+
+    // 👉 IMPORTANTÍSIMO:
+    // Si no hay conversationId, por defecto NO autocreamos para no interferir con el widget.
+    // Sólo autocreamos si CHATWOOT_AUTOCREATE=1 (p.ej. para integraciones externas sin widget).
+    if (!cid && isTruthy(REPLY_VIA_API) && isTruthy(CHATWOOT_AUTOCREATE)) {
       try {
-        const name = req.body?.message?.sender?.name || 'Visitante'
-        let email = req.body?.message?.sender?.email
-        if (!email) email = `sin-email-${Date.now()}@axioma-creativa.local`
-        const phone = req.body?.message?.sender?.phone_number || ''
-        cid = await createContactAndConversation(accountId, name, email, phone)
+        const sender = extractSender(req.body)
+        if (!sender.email) sender.email = `sin-email-${Date.now()}@axioma-creativa.local`
+        cid = await createContactAndConversation(accountId, sender.name, sender.email, sender.phone)
+        log(`[${reqId}] ✅ Conversación creada (autocreate) id=${cid}`)
       } catch (e) {
-        log(`[${reqId}] ❌ Error creando conversación: ${e.message}`)
+        const st = e?.response?.status
+        const body = e?.response?.data
+        log(`[${reqId}] ❌ No se pudo autocrear conv status=${st} body=${JSON.stringify(body)} err=${e.message}`)
       }
+    } else if (!cid) {
+      log(`[${reqId}] ⚠️ No hay conversation.id (widget debe crearla) — AUTOCREATE=OFF`)
     }
+
     const prior = cid ? (hist.get(cid) || []) : []
     const messages = [
       {
         role: 'system',
         content:
 `Eres un asistente profesional de Axioma Creativa (Madrid).
-Estilo: claro, conciso y cercano. Nuestros servicios van enfocados a soluciones IA para pequeñas y medianas empresas , paginas web , bot , procesos , automatizaciones, edicion de videos , avatares
+Estilo: claro, conciso y cercano. Servicios: soluciones con IA para pymes, páginas web, bots, procesos y automatizaciones, edición de vídeo y avatares.
 Si preguntan por precios, explica que cada caso requiere entender objetivos, alcance y plazos; invita a agendar videollamada en ${CTA_URL}.
 Mantén coherencia con el contexto previo.`
       },
       ...prior.map(m => ({ role: m.role, content: m.content })),
       { role: 'user', content: userMessage }
     ]
+
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⇢ GROQ model=${GROQ_MODEL} url=${GROQ_URL}`)
     const g = await axios.post(GROQ_URL, {
       model: GROQ_MODEL,
       messages,
@@ -263,30 +311,44 @@ Mantén coherencia con el contexto previo.`
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
       timeout: 15000
     })
+
+    if (isTruthy(LOG_GROQ_RESP)) {
+      log(`[${reqId}] ⇠ GROQ:`, JSON.stringify(g.data, null, 2))
+    } else if (isTruthy(LOG_DECISIONS)) {
+      log(`[${reqId}] ⇠ GROQ status=${g.status}`)
+    }
+
     let botReply = g.data?.choices?.[0]?.message?.content?.trim()
     if (!botReply) botReply = `📅 Agenda aquí: ${CTA_URL}`
     if (!botReply.includes(CTA_URL)) botReply += `\n\n📅 ¿Agendamos? ${CTA_URL}`
+
+    // Guardar historial
     if (cid) {
       const arr = hist.get(cid) || []
       arr.push({ role: 'user', content: userMessage, ts: Date.now() })
       arr.push({ role: 'assistant', content: botReply, ts: Date.now() })
       hist.set(cid, arr.slice(-HISTORY_MAX))
     }
+
+    // Responder al webhook
     res.status(200).json({ content: botReply, private: false })
+
+    // Publicar en Chatwoot si corresponde
     if (isTruthy(REPLY_VIA_API) && cid) {
       try {
-        const resp = await postToChatwoot({
-          accountId,
-          conversationId: cid,
-          content: botReply
-        })
+        const resp = await postToChatwoot({ accountId, conversationId: cid, content: botReply })
         log(`[${reqId}] ⇠ Chatwoot status=${resp.status}`)
       } catch (e) {
-        log(`[${reqId}] ❌ Chatwoot POST error: ${e.message}`)
+        const st = e?.response?.status
+        const body = e?.response?.data
+        log(`[${reqId}] ❌ Chatwoot POST error status=${st} body=${JSON.stringify(body)}`)
       }
     }
+
   } catch (err) {
-    log(`[${reqId}] ❌ GROQ error: ${err.message}`)
+    const st = err?.response?.status
+    const body = err?.response?.data || err.message
+    log(`[${reqId}] ❌ GROQ error status=${st} body=${JSON.stringify(body)}`)
     return res.status(200).json({
       content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo?\n📅 ' + CTA_URL,
       private: false
