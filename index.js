@@ -8,7 +8,8 @@ app.use(express.json({ limit: '1mb' }))
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token'],
+  // añadimos también 'api_access_token' por si lo llamas desde navegador
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token', 'api_access_token'],
 }))
 
 // === Env ===
@@ -45,6 +46,7 @@ setInterval(() => {
 // Helpers
 const isTruthy = v => v === 1 || v === '1' || v === true || v === 'true'
 
+// Extractores robustos (top-level o anidado)
 function extractIncomingText(body) {
   return body?.message?.content
       ?? body?.content
@@ -61,19 +63,25 @@ function extractConversationId(body) {
 }
 
 function extractMessageId(body) {
-  return body?.message?.id ?? body?.id ?? null
+  return body?.message?.id
+      ?? body?.id
+      ?? null
 }
 
 function extractAccountId(body) {
-  return body?.account?.id ?? body?.account_id ?? 1
+  return body?.account?.id
+      ?? body?.account_id
+      ?? 1
 }
 
 // POST a Chatwoot
 async function postToChatwoot({ accountId, conversationId, content }) {
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
   const headers = { 'Content-Type': 'application/json' }
+
+  // Para tu instancia: usar header api_access_token (no X-Api-Access-Token)
   if (CHATWOOT_AUTH_MODE === 'xheader') {
-    headers['X-Api-Access-Token'] = CHATWOOT_TOKEN
+    headers['api_access_token'] = CHATWOOT_TOKEN
   } else {
     url += (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
   }
@@ -99,20 +107,36 @@ app.post('/chat', async (req, res) => {
   }
 
   const event = req.body?.event || ''
-  const typeRaw = req.body?.message?.message_type
-  const isIncoming = typeRaw === 0 || typeRaw === '0' || String(typeRaw).toLowerCase() === 'incoming'
-  const isContact = (req.body?.message?.sender_type || '').toLowerCase() === 'contact'
-  const isActivity = typeRaw === 3 || typeRaw === '3'
+
+  // Aceptar message_type/sender_type en message.* o a nivel raíz
+  const typeRaw =
+    req.body?.message?.message_type ??
+    req.body?.message_type
+
+  const senderTypeRaw =
+    req.body?.message?.sender_type ??
+    req.body?.sender_type ??
+    ''
+
+  const typeStr = String(typeRaw).toLowerCase()
+  const isIncoming =
+    typeRaw === 0 ||
+    typeRaw === '0' ||
+    typeStr === 'incoming' // 0 | "0" | "incoming"
+
+  // Si no llega sender_type, asumimos contact cuando sea incoming
+  const senderType = String(senderTypeRaw).toLowerCase()
+  const isContact = senderType ? senderType === 'contact' : isIncoming
 
   if (isTruthy(LOG_DECISIONS)) {
-    log(`[${reqId}] decision: event=${event} isIncoming=${isIncoming} isContact=${isContact} isActivity=${isActivity}`)
+    log(`[${reqId}] decision: event=${event} isIncoming=${isIncoming} isContact=${isContact}`)
   }
 
   if (event && event !== 'message_created') {
     if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️  skip: event ${event}`)
     return res.status(200).json({ ok: true, skipped: true })
   }
-  if (!isIncoming || !isContact || isActivity) {
+  if (!isIncoming || !isContact) {
     if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️  skip: not incoming contact`)
     return res.status(200).json({ ok: true, skipped: true })
   }
@@ -167,8 +191,10 @@ app.post('/chat', async (req, res) => {
 
     log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 120)}${botReply.length > 120 ? '…' : ''}`)
 
+    // Responder al webhook rápido
     res.status(200).json({ content: botReply, private: false })
 
+    // Publicar en Chatwoot si está activado
     if (isTruthy(REPLY_VIA_API)) {
       const conversationId = extractConversationId(req.body)
       const accountId = extractAccountId(req.body)
@@ -200,6 +226,7 @@ app.post('/chat', async (req, res) => {
     const status = err?.response?.status
     const data = err?.response?.data || err.message
     log(`[${reqId}] ❌ GROQ error status=${status} body=${JSON.stringify(data)}`)
+    // Devolvemos 200 para evitar reintentos infinitos del webhook
     return res.status(200).json({ content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo?', private: false })
   }
 })
