@@ -8,7 +8,6 @@ app.use(express.json({ limit: '1mb' }))
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  // permitimos también 'api_access_token' por si algún cliente lo envía desde navegador
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token', 'api_access_token'],
 }))
 
@@ -20,6 +19,7 @@ const {
   CHATWOOT_URL = '',
   CHATWOOT_TOKEN = '',
   CHATWOOT_AUTH_MODE = 'xheader', // xheader | query
+  CHATWOOT_INBOX_ID = '',
   REPLY_VIA_API = '0',
   LOG_BODY = '0',
   LOG_GROQ_RESP = '0',
@@ -29,17 +29,17 @@ const {
 // === Config conversación y CTA ===
 const CTA_URL = 'https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo'
 
-// Palabras que disparan la intención de precios → CTA
+// Palabras que disparan la intención de precios
 const PRICE_KEYWORDS = [
   'precio','precios','tarifa','tarifas','coste','costo','cuánto','cuanto',
   'presupuesto','valen','cuesta','cuestan','cotización','cotizacion'
 ]
 const isPriceIntent = (t = '') => PRICE_KEYWORDS.some(k => t.toLowerCase().includes(k))
 
-// Memoria corta por conversación (para no perder el hilo)
-const hist = new Map()             // key: conversationId -> [{role, content, ts}]
-const HISTORY_TTL = 15 * 60 * 1000 // 15 min
-const HISTORY_MAX = 8              // últimos 8 turnos (user+assistant)
+// Memoria corta por conversación
+const hist = new Map()
+const HISTORY_TTL = 15 * 60 * 1000
+const HISTORY_MAX = 8
 setInterval(() => {
   const now = Date.now()
   for (const [cid, arr] of hist) {
@@ -66,7 +66,7 @@ setInterval(() => {
   for (const [k, v] of seen.entries()) if (now - v > SEEN_TTL_MS) seen.delete(k)
 }, 60 * 1000)
 
-// Extractores robustos (top-level o anidado)
+// Extractores
 function extractIncomingText(body) {
   return body?.message?.content
       ?? body?.content
@@ -95,7 +95,6 @@ function extractAccountId(body) {
 async function postToChatwoot({ accountId, conversationId, content }) {
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
   const headers = { 'Content-Type': 'application/json' }
-  // Para tu instancia: usar header api_access_token (no X-Api-Access-Token)
   if (CHATWOOT_AUTH_MODE === 'xheader') {
     headers['api_access_token'] = CHATWOOT_TOKEN
   } else {
@@ -108,7 +107,39 @@ async function postToChatwoot({ accountId, conversationId, content }) {
   }, { headers, timeout: 15000 })
 }
 
-// Rutas
+// Crear contacto y conversación
+async function createContactAndConversation(accountId, name, email, phone) {
+  let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/contacts`
+  const headers = { 'Content-Type': 'application/json' }
+  if (CHATWOOT_AUTH_MODE === 'xheader') {
+    headers['api_access_token'] = CHATWOOT_TOKEN
+  } else {
+    url += `?api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
+  }
+  const contactResp = await axios.post(url, {
+    name,
+    email,
+    phone_number: phone,
+    inbox_id: CHATWOOT_INBOX_ID
+  }, { headers })
+  const contactId = contactResp.data?.id
+  if (!contactId) throw new Error('No se pudo obtener contact.id')
+
+  url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations`
+  if (CHATWOOT_AUTH_MODE !== 'xheader') {
+    url += `?api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
+  }
+  const convResp = await axios.post(url, {
+    inbox_id: CHATWOOT_INBOX_ID,
+    contact_id: contactId,
+    status: 'open'
+  }, { headers })
+  const conversationId = convResp.data?.id
+  if (!conversationId) throw new Error('No se pudo obtener conversation.id')
+  return conversationId
+}
+
+// === Rutas ===
 app.get('/', (_, res) => res.json({ ok: true, service: 'axioma-bot' }))
 
 app.post('/chat', async (req, res) => {
@@ -122,24 +153,10 @@ app.post('/chat', async (req, res) => {
   }
 
   const event = req.body?.event || ''
-
-  // Aceptar message_type/sender_type en message.* o a nivel raíz
-  const typeRaw =
-    req.body?.message?.message_type ??
-    req.body?.message_type
-
-  const senderTypeRaw =
-    req.body?.message?.sender_type ??
-    req.body?.sender_type ??
-    ''
-
+  const typeRaw = req.body?.message?.message_type ?? req.body?.message_type
+  const senderTypeRaw = req.body?.message?.sender_type ?? req.body?.sender_type ?? ''
   const typeStr = String(typeRaw).toLowerCase()
-  const isIncoming =
-    typeRaw === 0 ||
-    typeRaw === '0' ||
-    typeStr === 'incoming' // 0 | "0" | "incoming"
-
-  // Si no llega sender_type, asumimos contact cuando sea incoming
+  const isIncoming = typeRaw === 0 || typeRaw === '0' || typeStr === 'incoming'
   const senderType = String(senderTypeRaw).toLowerCase()
   const isContact = senderType ? senderType === 'contact' : isIncoming
 
@@ -148,11 +165,11 @@ app.post('/chat', async (req, res) => {
   }
 
   if (event && event !== 'message_created') {
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️  skip: event ${event}`)
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ skip: event ${event}`)
     return res.status(200).json({ ok: true, skipped: true })
   }
   if (!isIncoming || !isContact) {
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️  skip: not incoming contact`)
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ skip: not incoming contact`)
     return res.status(200).json({ ok: true, skipped: true })
   }
 
@@ -160,7 +177,7 @@ app.post('/chat', async (req, res) => {
   const msgId = extractMessageId(req.body)
   if (msgId) {
     if (seen.has(msgId)) {
-      if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️  duplicate message_id=${msgId}`)
+      if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ duplicate message_id=${msgId}`)
       return res.status(200).json({ ok: true, deduped: true })
     }
     seen.set(msgId, Date.now())
@@ -172,27 +189,33 @@ app.post('/chat', async (req, res) => {
     return res.status(200).json({ content: '¿Podrías repetirlo?', private: false })
   }
 
-  // --- Respuesta profesional para consultas de precio (sin llamar a la IA) ---
+  // --- Respuesta especial para precios ---
   if (isPriceIntent(userMessage)) {
     const content =
 `Gracias por tu interés. Cada proyecto es diferente y requiere entender objetivos, alcance y tiempos.
 Para darte un presupuesto serio, mejor agendamos una breve videollamada.
 📅 Reserva aquí: ${CTA_URL}
 ¿Te viene bien esta semana?`
-
-    // Responder al webhook
     res.status(200).json({ content, private: false })
 
-    // Publicar en Chatwoot si está activado
     if (isTruthy(REPLY_VIA_API)) {
-      const conversationId = extractConversationId(req.body)
+      let conversationId = extractConversationId(req.body)
       const accountId = extractAccountId(req.body)
+      if (!conversationId) {
+        try {
+          const name = req.body?.message?.sender?.name || 'Visitante'
+          let email = req.body?.message?.sender?.email
+          if (!email) email = `sin-email-${Date.now()}@axioma-creativa.local`
+          const phone = req.body?.message?.sender?.phone_number || ''
+          conversationId = await createContactAndConversation(accountId, name, email, phone)
+        } catch (e) {
+          log(`[${reqId}] ❌ Error creando conversación: ${e.message}`)
+        }
+      }
       if (conversationId) {
         try { await postToChatwoot({ accountId, conversationId, content }) } catch {}
       }
     }
-
-    // Guardar en memoria
     const cid = extractConversationId(req.body)
     if (cid) {
       const arr = hist.get(cid) || []
@@ -203,26 +226,34 @@ Para darte un presupuesto serio, mejor agendamos una breve videollamada.
     return
   }
 
-  // === Llama a Groq con historial para no perder el hilo ===
+  // === Llamada a GROQ ===
   try {
-    const cid = extractConversationId(req.body)
+    let cid = extractConversationId(req.body)
+    const accountId = extractAccountId(req.body)
+    if (!cid && isTruthy(REPLY_VIA_API)) {
+      try {
+        const name = req.body?.message?.sender?.name || 'Visitante'
+        let email = req.body?.message?.sender?.email
+        if (!email) email = `sin-email-${Date.now()}@axioma-creativa.local`
+        const phone = req.body?.message?.sender?.phone_number || ''
+        cid = await createContactAndConversation(accountId, name, email, phone)
+      } catch (e) {
+        log(`[${reqId}] ❌ Error creando conversación: ${e.message}`)
+      }
+    }
     const prior = cid ? (hist.get(cid) || []) : []
-
     const messages = [
       {
         role: 'system',
         content:
 `Eres un asistente profesional de Axioma Creativa (Madrid).
-Estilo: claro, conciso y cercano; evita divagar.
-Si preguntan por precios o tarifas, explica que cada caso requiere entender objetivos, alcance y plazos; invita a agendar videollamada en ${CTA_URL}.
-Solo si el usuario insiste en números, puedes dar rangos muy orientativos, pero prioriza la llamada.
+Estilo: claro, conciso y cercano. Nuestros servicios van enfocados a soluciones IA para pequeñas y medianas empresas , paginas web , bot , procesos , automatizaciones, edicion de videos , avatares
+Si preguntan por precios, explica que cada caso requiere entender objetivos, alcance y plazos; invita a agendar videollamada en ${CTA_URL}.
 Mantén coherencia con el contexto previo.`
       },
       ...prior.map(m => ({ role: m.role, content: m.content })),
       { role: 'user', content: userMessage }
     ]
-
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⇢ GROQ model=${GROQ_MODEL} url=${GROQ_URL}`)
     const g = await axios.post(GROQ_URL, {
       model: GROQ_MODEL,
       messages,
@@ -232,62 +263,32 @@ Mantén coherencia con el contexto previo.`
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
       timeout: 15000
     })
-
-    if (isTruthy(LOG_GROQ_RESP)) {
-      log(`[${reqId}] ⇠ GROQ:`, JSON.stringify(g.data, null, 2))
-    } else if (isTruthy(LOG_DECISIONS)) {
-      log(`[${reqId}] ⇠ GROQ status=${g.status}`)
-    }
-
     let botReply = g.data?.choices?.[0]?.message?.content?.trim()
-    if (!botReply) botReply = 'Puedo ayudarte con más detalles en una videollamada.\n📅 Agenda aquí: ' + CTA_URL
-
-    // Refuerzo suave del CTA si la respuesta no lo incluye
-    if (!botReply.includes(CTA_URL)) {
-      botReply += `\n\n📅 ¿Agendamos? ${CTA_URL}`
-    }
-
-    // Guardar historial
+    if (!botReply) botReply = `📅 Agenda aquí: ${CTA_URL}`
+    if (!botReply.includes(CTA_URL)) botReply += `\n\n📅 ¿Agendamos? ${CTA_URL}`
     if (cid) {
       const arr = hist.get(cid) || []
       arr.push({ role: 'user', content: userMessage, ts: Date.now() })
       arr.push({ role: 'assistant', content: botReply, ts: Date.now() })
       hist.set(cid, arr.slice(-HISTORY_MAX))
     }
-
-    // Responder al webhook
     res.status(200).json({ content: botReply, private: false })
-
-    // Publicar en Chatwoot si está activado
-    if (isTruthy(REPLY_VIA_API)) {
-      const conversationId = extractConversationId(req.body)
-      const accountId = extractAccountId(req.body)
-
-      if (!conversationId) {
-        log(`[${reqId}] ⚠️ No hay conversation.id en payload → no envío a Chatwoot`)
-      } else {
-        try {
-          const resp = await postToChatwoot({
-            accountId,
-            conversationId,
-            content: botReply
-          })
-          log(`[${reqId}] ⇠ Chatwoot status=${resp.status} id=${resp.data?.id ?? resp.data?.message?.id ?? 'n/a'}`)
-        } catch (e) {
-          const status = e?.response?.status
-          const data = e?.response?.data
-          log(`[${reqId}] ❌ Chatwoot POST error status=${status} body=${JSON.stringify(data)}`)
-        }
+    if (isTruthy(REPLY_VIA_API) && cid) {
+      try {
+        const resp = await postToChatwoot({
+          accountId,
+          conversationId: cid,
+          content: botReply
+        })
+        log(`[${reqId}] ⇠ Chatwoot status=${resp.status}`)
+      } catch (e) {
+        log(`[${reqId}] ❌ Chatwoot POST error: ${e.message}`)
       }
     }
-
   } catch (err) {
-    const status = err?.response?.status
-    const data = err?.response?.data || err.message
-    log(`[${reqId}] ❌ GROQ error status=${status} body=${JSON.stringify(data)}`)
-    // Devolvemos 200 para evitar reintentos infinitos del webhook
+    log(`[${reqId}] ❌ GROQ error: ${err.message}`)
     return res.status(200).json({
-      content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo en breve?\n📅 También puedes agendar: ' + CTA_URL,
+      content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo?\n📅 ' + CTA_URL,
       private: false
     })
   }
