@@ -2,14 +2,6 @@ import express from 'express'
 import axios from 'axios'
 import cors from 'cors'
 
-/**
- * Axioma-bot – Chatwoot webhook handler
- * - NO devuelve contenido al webhook (evita carreras).
- * - Publica SIEMPRE la respuesta vía API en la conversación existente.
- * - Mantiene historial breve por conversación para conservar el contexto.
- * - Opcional: puede autocrear contacto/conversación si no viene conversation.id (desactivado por defecto).
- */
-
 const app = express()
 app.use(express.json({ limit: '1mb' }))
 
@@ -24,44 +16,29 @@ const {
   GROQ_API_KEY,
   GROQ_MODEL = 'llama3-70b-8192',
   GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions',
-
   CHATWOOT_URL = '',
   CHATWOOT_TOKEN = '',
-  CHATWOOT_AUTH_MODE = 'xheader',   // xheader | query
-  CHATWOOT_INBOX_ID = '',           // requerido si activas AUTOCREATE
-  CHATWOOT_AUTOCREATE = '0',        // 0 OFF (recomendado con widget) | 1 ON (integraciones sin widget)
-
-  REPLY_VIA_API = '1',              // publicar respuestas en Chatwoot
+  CHATWOOT_AUTH_MODE = 'xheader', // xheader | query
+  CHATWOOT_INBOX_ID = '',
+  REPLY_VIA_API = '0',
   LOG_BODY = '0',
   LOG_GROQ_RESP = '0',
   LOG_DECISIONS = '0',
-
-  CTA_URL = 'https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo',
+  ALLOWED_INBOX_IDS = '', // <-- NUEVO
 } = process.env
 
-// === Mensajería ===
-function log(...args) { console.log(...args) }
-function nowId() { return Math.random().toString(36).slice(2, 10) }
-const isTruthy = v => v === 1 || v === '1' || v === true || v === 'true'
-const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+// === Config conversación y CTA ===
+const CTA_URL = 'https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo'
 
-log('✅ Bot running on port', process.env.PORT || 3000)
-log('   Model:', GROQ_MODEL)
-log('   GROQ_URL:', GROQ_URL)
-log('   CHATWOOT_AUTH_MODE:', CHATWOOT_AUTH_MODE)
-log('   REPLY_VIA_API:', isTruthy(REPLY_VIA_API) ? 'ON' : 'OFF')
-log('   AUTOCREATE:', isTruthy(CHATWOOT_AUTOCREATE) ? 'ON' : 'OFF')
+// Palabras que disparan la intención de precios
+const PRICE_KEYWORDS = [
+  'precio','precios','tarifa','tarifas','coste','costo','cuánto','cuanto',
+  'presupuesto','valen','cuesta','cuestan','cotización','cotizacion'
+]
+const isPriceIntent = (t = '') => PRICE_KEYWORDS.some(k => t.toLowerCase().includes(k))
 
-// === Dedupe por message.id con TTL ===
-const seen = new Map()
-const SEEN_TTL_MS = 5 * 60 * 1000
-setInterval(() => {
-  const now = Date.now()
-  for (const [k, v] of seen.entries()) if (now - v > SEEN_TTL_MS) seen.delete(k)
-}, 60 * 1000)
-
-// === Memoria corta por conversación ===
-const hist = new Map()             // conversationId -> [{role, content, ts}]
+// Memoria corta por conversación
+const hist = new Map()
 const HISTORY_TTL = 15 * 60 * 1000
 const HISTORY_MAX = 8
 setInterval(() => {
@@ -71,14 +48,38 @@ setInterval(() => {
   }
 }, 60 * 1000)
 
-// === Intención de precio ===
-const PRICE_KEYWORDS = [
-  'precio','precios','tarifa','tarifas','coste','costo','cuánto','cuanto',
-  'presupuesto','valen','cuesta','cuestan','cotización','cotizacion'
-]
-const isPriceIntent = (t = '') => PRICE_KEYWORDS.some(k => t.toLowerCase().includes(k))
+// === Utils ===
+function log(...args) { console.log(...args) }
+function nowId() { return Math.random().toString(36).slice(2, 10) }
+const isTruthy = v => v === 1 || v === '1' || v === true || v === 'true'
 
-// === Extractores robustos ===
+// NUEVO: filtro por inbox permitido
+function isAllowedInbox(body) {
+  const allowed = ALLOWED_INBOX_IDS
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const inboxId = body?.inbox?.id || body?.conversation?.inbox_id || body?.message?.inbox_id;
+  if (!allowed.length) return true;
+  return allowed.includes(String(inboxId));
+}
+
+log('✅ Bot running on port', process.env.PORT || 3000)
+log('   Model:', GROQ_MODEL)
+log('   GROQ_URL:', GROQ_URL)
+log('   CHATWOOT_AUTH_MODE:', CHATWOOT_AUTH_MODE)
+log('   REPLY_VIA_API:', REPLY_VIA_API === '1' ? 'ON' : 'OFF')
+log('   ALLOWED_INBOX_IDS:', ALLOWED_INBOX_IDS || '(sin filtro)')
+
+// === Dedupe por message.id con TTL ===
+const seen = new Map()
+const SEEN_TTL_MS = 5 * 60 * 1000
+setInterval(() => {
+  const now = Date.now()
+  for (const [k, v] of seen.entries()) if (now - v > SEEN_TTL_MS) seen.delete(k)
+}, 60 * 1000)
+
+// Extractores
 function extractIncomingText(body) {
   return body?.message?.content
       ?? body?.content
@@ -102,57 +103,51 @@ function extractAccountId(body) {
       ?? body?.account_id
       ?? 1
 }
-function extractSender(body) {
-  return {
-    name: body?.message?.sender?.name || 'Visitante',
-    email: body?.message?.sender?.email || null,
-    phone: body?.message?.sender?.phone_number || null,
-  }
-}
 
-// === Chatwoot helpers ===
-function cwHeaders() {
-  const h = { 'Content-Type': 'application/json' }
-  // En tu instancia funciona 'api_access_token' (no X-Api-Access-Token)
-  if (CHATWOOT_AUTH_MODE === 'xheader') h['api_access_token'] = CHATWOOT_TOKEN
-  return h
-}
-function withToken(url) {
-  if (CHATWOOT_AUTH_MODE === 'xheader') return url
-  return url + (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
-}
-
+// POST a Chatwoot
 async function postToChatwoot({ accountId, conversationId, content }) {
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
-  url = withToken(url)
+  const headers = { 'Content-Type': 'application/json' }
+  if (CHATWOOT_AUTH_MODE === 'xheader') {
+    headers['api_access_token'] = CHATWOOT_TOKEN
+  } else {
+    url += (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
+  }
   return axios.post(url, {
     content,
     message_type: 'outgoing',
     private: false
-  }, { headers: cwHeaders(), timeout: 15000 })
+  }, { headers, timeout: 15000 })
 }
 
+// Crear contacto y conversación
 async function createContactAndConversation(accountId, name, email, phone) {
-  // 1) Crear contacto
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/contacts`
-  url = withToken(url)
-  const c = await axios.post(url, {
+  const headers = { 'Content-Type': 'application/json' }
+  if (CHATWOOT_AUTH_MODE === 'xheader') {
+    headers['api_access_token'] = CHATWOOT_TOKEN
+  } else {
+    url += `?api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
+  }
+  const contactResp = await axios.post(url, {
     name,
-    email: email || undefined,
-    phone_number: phone || undefined
-  }, { headers: cwHeaders(), timeout: 15000 })
-  const contactId = c.data?.id || c.data?.contact?.id
+    email,
+    phone_number: phone,
+    inbox_id: CHATWOOT_INBOX_ID
+  }, { headers })
+  const contactId = contactResp.data?.id
   if (!contactId) throw new Error('No se pudo obtener contact.id')
 
-  // 2) Crear conversación
   url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations`
-  url = withToken(url)
-  const conv = await axios.post(url, {
-    inbox_id: Number(CHATWOOT_INBOX_ID),
-    contact_id: Number(contactId),
+  if (CHATWOOT_AUTH_MODE !== 'xheader') {
+    url += `?api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
+  }
+  const convResp = await axios.post(url, {
+    inbox_id: CHATWOOT_INBOX_ID,
+    contact_id: contactId,
     status: 'open'
-  }, { headers: cwHeaders(), timeout: 15000 })
-  const conversationId = conv.data?.id || conv.data?.conversation?.id
+  }, { headers })
+  const conversationId = convResp.data?.id
   if (!conversationId) throw new Error('No se pudo obtener conversation.id')
   return conversationId
 }
@@ -162,138 +157,121 @@ app.get('/', (_, res) => res.json({ ok: true, service: 'axioma-bot' }))
 
 app.post('/chat', async (req, res) => {
   const reqId = nowId()
-  log(`\n[${reqId}] === Chatwoot webhook ===`)
+  const ip = req.headers['x-real-ip'] || req.ip
+  log(`[${new Date().toISOString()}] [${reqId}] ⇢ POST /chat from ${ip}`)
 
-  if (!req.body) {
-    log(`[${reqId}] ❌ Body vacío`)
-    return res.status(400).json({ error: 'invalid body' })
+  if (!isAllowedInbox(req.body)) {
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ inbox no permitido`);
+    return res.status(200).json({ ok: true, skipped: true });
   }
 
   if (isTruthy(LOG_BODY)) {
-    log(`[${reqId}] Body:`, JSON.stringify(req.body, null, 2))
+    log(`[${reqId}] ⇢ Headers:`, JSON.stringify(req.headers, null, 2))
+    log(`[${reqId}] ⇢ Body:`, JSON.stringify(req.body, null, 2))
   }
 
-  const event = req.body.event || ''
-  const accountId = extractAccountId(req.body)
+  const event = req.body?.event || ''
+  const typeRaw = req.body?.message?.message_type ?? req.body?.message_type
+  const senderTypeRaw = req.body?.message?.sender_type ?? req.body?.sender_type ?? ''
+  const typeStr = String(typeRaw).toLowerCase()
+  const isIncoming = typeRaw === 0 || typeRaw === '0' || typeStr === 'incoming'
+  const senderType = String(senderTypeRaw).toLowerCase()
+  const isContact = senderType ? senderType === 'contact' : isIncoming
 
-  // Dedupe por message.id (si lo hay)
-  const mid = extractMessageId(req.body)
-  if (mid) {
-    if (seen.has(mid)) {
-      if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ duplicado msgId=${mid}`)
+  if (isTruthy(LOG_DECISIONS)) {
+    log(`[${reqId}] decision: event=${event} isIncoming=${isIncoming} isContact=${isContact}`)
+  }
+
+  if (event && event !== 'message_created') {
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ skip: event ${event}`)
+    return res.status(200).json({ ok: true, skipped: true })
+  }
+  if (!isIncoming || !isContact) {
+    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ skip: not incoming contact`)
+    return res.status(200).json({ ok: true, skipped: true })
+  }
+
+  // Dedupe
+  const msgId = extractMessageId(req.body)
+  if (msgId) {
+    if (seen.has(msgId)) {
+      if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ duplicate message_id=${msgId}`)
       return res.status(200).json({ ok: true, deduped: true })
     }
-    seen.set(mid, Date.now())
+    seen.set(msgId, Date.now())
   }
 
-  // Responder SIEMPRE rápido al webhook (sin contenido) para evitar reintentos/carreras
-  res.status(200).json({ ok: true })
-
-  // ==== Ramas de eventos ====
-  if (event === 'conversation_created') {
-    // Opcional: enviar saludo inicial cuando la regla asigne al bot
-    const cid = extractConversationId(req.body)
-    if (!cid || !isTruthy(REPLY_VIA_API)) return
-    try {
-      await sleep(300) // pequeña espera para consolidar conversación
-      const content =
-        `¡Hola! Soy el asistente de Axioma Creativa. 🙌 ¿En qué te puedo ayudar hoy?\n` +
-        `Si buscas precios, te propongo una breve videollamada para entender tu caso y darte un presupuesto serio.\n` +
-        `📅 Agenda aquí: ${CTA_URL}`
-      await postToChatwoot({ accountId, conversationId: cid, content })
-      log(`[${reqId}] ✅ Saludo publicado en conv=${cid}`)
-    } catch (e) {
-      log(`[${reqId}] ❌ Error saludo conv:`, e?.response?.status, e?.response?.data || e.message)
-    }
-    return
-  }
-
-  if (event !== 'message_created') {
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ evento no manejado: ${event}`)
-    return
-  }
-
-  // Validar que sea entrante de contacto
-  const msg = req.body.message || {}
-  const typeRaw = msg.message_type ?? req.body.message_type
-  const senderTypeRaw = msg.sender_type ?? req.body.sender_type ?? ''
-  const isIncoming = typeRaw === 0 || typeRaw === '0' || String(typeRaw).toLowerCase() === 'incoming'
-  const isContact = String(senderTypeRaw).toLowerCase() === 'contact' || isIncoming
-
-  if (!isIncoming || !isContact) {
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⏭️ no es incoming contact`)
-    return
-  }
-
-  // Extraer conversación
-  let conversationId = extractConversationId(req.body)
-  if (!conversationId) {
-    if (isTruthy(CHATWOOT_AUTOCREATE)) {
-      // Para integraciones SIN widget: autocrear
-      try {
-        const s = extractSender(req.body)
-        if (!s.email) s.email = `sin-email-${Date.now()}@axioma-creativa.local`
-        conversationId = await createContactAndConversation(accountId, s.name, s.email, s.phone)
-        log(`[${reqId}] 🆕 conv creada (autocreate) id=${conversationId}`)
-      } catch (e) {
-        log(`[${reqId}] ❌ autocreate falló:`, e?.response?.status, e?.response?.data || e.message)
-        return
-      }
-    } else {
-      log(`[${reqId}] ⚠️ message_created sin conversation.id (esperado si no hay primer mensaje real)`)
-      return
-    }
-  }
-
-  // Texto del usuario
   const userMessage = extractIncomingText(req.body)
   if (!userMessage) {
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⚠️ sin texto entrante`)
-    return
+    log(`[${reqId}] ⚠️ Sin texto entrante`)
+    return res.status(200).json({ content: '¿Podrías repetirlo?', private: false })
   }
 
-  // === Respuesta rápida para intención de precios (sin IA) ===
+  // --- Respuesta especial para precios ---
   if (isPriceIntent(userMessage)) {
     const content =
 `Gracias por tu interés. Cada proyecto es diferente y requiere entender objetivos, alcance y tiempos.
 Para darte un presupuesto serio, mejor agendamos una breve videollamada.
 📅 Reserva aquí: ${CTA_URL}
 ¿Te viene bien esta semana?`
+    res.status(200).json({ content, private: false })
 
-    try {
-      await sleep(300)
-      if (isTruthy(REPLY_VIA_API)) {
-        await postToChatwoot({ accountId, conversationId, content })
-        log(`[${reqId}] ✅ Precio → publicado conv=${conversationId}`)
+    if (isTruthy(REPLY_VIA_API)) {
+      let conversationId = extractConversationId(req.body)
+      const accountId = extractAccountId(req.body)
+      if (!conversationId) {
+        try {
+          const name = req.body?.message?.sender?.name || 'Visitante'
+          let email = req.body?.message?.sender?.email
+          if (!email) email = `sin-email-${Date.now()}@axioma-creativa.local`
+          const phone = req.body?.message?.sender?.phone_number || ''
+          conversationId = await createContactAndConversation(accountId, name, email, phone)
+        } catch (e) {
+          log(`[${reqId}] ❌ Error creando conversación: ${e.message}`)
+        }
       }
-      // Historial
-      const arr = hist.get(conversationId) || []
+      if (conversationId) {
+        try { await postToChatwoot({ accountId, conversationId, content }) } catch {}
+      }
+    }
+    const cid = extractConversationId(req.body)
+    if (cid) {
+      const arr = hist.get(cid) || []
       arr.push({ role: 'user', content: userMessage, ts: Date.now() })
       arr.push({ role: 'assistant', content, ts: Date.now() })
-      hist.set(conversationId, arr.slice(-HISTORY_MAX))
-    } catch (e) {
-      log(`[${reqId}] ❌ Precio → fallo publicar:`, e?.response?.status, e?.response?.data || e.message)
+      hist.set(cid, arr.slice(-HISTORY_MAX))
     }
     return
   }
 
-  // === Flujo normal con GROQ (con historial) ===
+  // === Llamada a GROQ ===
   try {
-    const prior = hist.get(conversationId) || []
+    let cid = extractConversationId(req.body)
+    const accountId = extractAccountId(req.body)
+    if (!cid && isTruthy(REPLY_VIA_API)) {
+      try {
+        const name = req.body?.message?.sender?.name || 'Visitante'
+        let email = req.body?.message?.sender?.email
+        if (!email) email = `sin-email-${Date.now()}@axioma-creativa.local`
+        const phone = req.body?.message?.sender?.phone_number || ''
+        cid = await createContactAndConversation(accountId, name, email, phone)
+      } catch (e) {
+        log(`[${reqId}] ❌ Error creando conversación: ${e.message}`)
+      }
+    }
+    const prior = cid ? (hist.get(cid) || []) : []
     const messages = [
       {
         role: 'system',
         content:
 `Eres un asistente profesional de Axioma Creativa (Madrid).
-Estilo: claro, conciso y cercano; evita divagar.
+Estilo: claro, conciso y cercano. Nuestros servicios van enfocados a soluciones IA para pequeñas y medianas empresas , paginas web , bot , procesos , automatizaciones, edicion de videos , avatares
 Si preguntan por precios, explica que cada caso requiere entender objetivos, alcance y plazos; invita a agendar videollamada en ${CTA_URL}.
 Mantén coherencia con el contexto previo.`
       },
       ...prior.map(m => ({ role: m.role, content: m.content })),
       { role: 'user', content: userMessage }
     ]
-
-    if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⇢ GROQ ${GROQ_MODEL}`)
     const g = await axios.post(GROQ_URL, {
       model: GROQ_MODEL,
       messages,
@@ -303,40 +281,36 @@ Mantén coherencia con el contexto previo.`
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
       timeout: 15000
     })
-
-    if (isTruthy(LOG_GROQ_RESP)) {
-      log(`[${reqId}] ⇠ GROQ:`, JSON.stringify(g.data, null, 2))
-    }
-
     let botReply = g.data?.choices?.[0]?.message?.content?.trim()
     if (!botReply) botReply = `📅 Agenda aquí: ${CTA_URL}`
     if (!botReply.includes(CTA_URL)) botReply += `\n\n📅 ¿Agendamos? ${CTA_URL}`
-
-    // Publicar en Chatwoot (pequeño delay)
-    if (isTruthy(REPLY_VIA_API)) {
-      await sleep(300)
-      const resp = await postToChatwoot({ accountId, conversationId, content: botReply })
-      log(`[${reqId}] ✅ GROQ → publicado status=${resp.status} conv=${conversationId}`)
+    if (cid) {
+      const arr = hist.get(cid) || []
+      arr.push({ role: 'user', content: userMessage, ts: Date.now() })
+      arr.push({ role: 'assistant', content: botReply, ts: Date.now() })
+      hist.set(cid, arr.slice(-HISTORY_MAX))
     }
-
-    // Historial
-    const arr = hist.get(conversationId) || []
-    arr.push({ role: 'user', content: userMessage, ts: Date.now() })
-    arr.push({ role: 'assistant', content: botReply, ts: Date.now() })
-    hist.set(conversationId, arr.slice(-HISTORY_MAX))
-
+    res.status(200).json({ content: botReply, private: false })
+    if (isTruthy(REPLY_VIA_API) && cid) {
+      try {
+        const resp = await postToChatwoot({
+          accountId,
+          conversationId: cid,
+          content: botReply
+        })
+        log(`[${reqId}] ⇠ Chatwoot status=${resp.status}`)
+      } catch (e) {
+        log(`[${reqId}] ❌ Chatwoot POST error: ${e.message}`)
+      }
+    }
   } catch (err) {
-    const st = err?.response?.status
-    const body = err?.response?.data || err.message
-    log(`[${reqId}] ❌ GROQ error status=${st} body=${JSON.stringify(body)}`)
-    // Intento de fallback corto
-    try {
-      const fallback = `Ahora mismo estoy saturado 😅. ¿Te va bien agendar una breve videollamada?\n📅 ${CTA_URL}`
-      await postToChatwoot({ accountId, conversationId, content: fallback })
-    } catch {}
+    log(`[${reqId}] ❌ GROQ error: ${err.message}`)
+    return res.status(200).json({
+      content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo?\n📅 ' + CTA_URL,
+      private: false
+    })
   }
 })
 
-// Start
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {})
