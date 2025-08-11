@@ -8,7 +8,7 @@ app.use(express.json({ limit: '1mb' }))
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  // añadimos también 'api_access_token' por si lo llamas desde navegador
+  // permitimos también 'api_access_token' por si algún cliente lo envía desde navegador
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Api-Access-Token', 'api_access_token'],
 }))
 
@@ -26,8 +26,31 @@ const {
   LOG_DECISIONS = '0',
 } = process.env
 
+// === Config conversación y CTA ===
+const CTA_URL = 'https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo'
+
+// Palabras que disparan la intención de precios → CTA
+const PRICE_KEYWORDS = [
+  'precio','precios','tarifa','tarifas','coste','costo','cuánto','cuanto',
+  'presupuesto','valen','cuesta','cuestan','cotización','cotizacion'
+]
+const isPriceIntent = (t = '') => PRICE_KEYWORDS.some(k => t.toLowerCase().includes(k))
+
+// Memoria corta por conversación (para no perder el hilo)
+const hist = new Map()             // key: conversationId -> [{role, content, ts}]
+const HISTORY_TTL = 15 * 60 * 1000 // 15 min
+const HISTORY_MAX = 8              // últimos 8 turnos (user+assistant)
+setInterval(() => {
+  const now = Date.now()
+  for (const [cid, arr] of hist) {
+    if (!arr.length || now - arr[arr.length - 1].ts > HISTORY_TTL) hist.delete(cid)
+  }
+}, 60 * 1000)
+
+// === Utils ===
 function log(...args) { console.log(...args) }
 function nowId() { return Math.random().toString(36).slice(2, 10) }
+const isTruthy = v => v === 1 || v === '1' || v === true || v === 'true'
 
 log('✅ Bot running on port', process.env.PORT || 3000)
 log('   Model:', GROQ_MODEL)
@@ -43,9 +66,6 @@ setInterval(() => {
   for (const [k, v] of seen.entries()) if (now - v > SEEN_TTL_MS) seen.delete(k)
 }, 60 * 1000)
 
-// Helpers
-const isTruthy = v => v === 1 || v === '1' || v === true || v === 'true'
-
 // Extractores robustos (top-level o anidado)
 function extractIncomingText(body) {
   return body?.message?.content
@@ -54,20 +74,17 @@ function extractIncomingText(body) {
       ?? body?.input
       ?? ''
 }
-
 function extractConversationId(body) {
   return body?.conversation?.id
       ?? body?.conversation_id
       ?? body?.id
       ?? null
 }
-
 function extractMessageId(body) {
   return body?.message?.id
       ?? body?.id
       ?? null
 }
-
 function extractAccountId(body) {
   return body?.account?.id
       ?? body?.account_id
@@ -78,14 +95,12 @@ function extractAccountId(body) {
 async function postToChatwoot({ accountId, conversationId, content }) {
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
   const headers = { 'Content-Type': 'application/json' }
-
   // Para tu instancia: usar header api_access_token (no X-Api-Access-Token)
   if (CHATWOOT_AUTH_MODE === 'xheader') {
     headers['api_access_token'] = CHATWOOT_TOKEN
   } else {
     url += (url.includes('?') ? '&' : '?') + `api_access_token=${encodeURIComponent(CHATWOOT_TOKEN)}`
   }
-
   return axios.post(url, {
     content,
     message_type: 'outgoing',
@@ -157,21 +172,62 @@ app.post('/chat', async (req, res) => {
     return res.status(200).json({ content: '¿Podrías repetirlo?', private: false })
   }
 
-  // Llama a Groq
+  // --- Respuesta profesional para consultas de precio (sin llamar a la IA) ---
+  if (isPriceIntent(userMessage)) {
+    const content =
+`Gracias por tu interés. Cada proyecto es diferente y requiere entender objetivos, alcance y tiempos.
+Para darte un presupuesto serio, mejor agendamos una breve videollamada.
+📅 Reserva aquí: ${CTA_URL}
+¿Te viene bien esta semana?`
+
+    // Responder al webhook
+    res.status(200).json({ content, private: false })
+
+    // Publicar en Chatwoot si está activado
+    if (isTruthy(REPLY_VIA_API)) {
+      const conversationId = extractConversationId(req.body)
+      const accountId = extractAccountId(req.body)
+      if (conversationId) {
+        try { await postToChatwoot({ accountId, conversationId, content }) } catch {}
+      }
+    }
+
+    // Guardar en memoria
+    const cid = extractConversationId(req.body)
+    if (cid) {
+      const arr = hist.get(cid) || []
+      arr.push({ role: 'user', content: userMessage, ts: Date.now() })
+      arr.push({ role: 'assistant', content, ts: Date.now() })
+      hist.set(cid, arr.slice(-HISTORY_MAX))
+    }
+    return
+  }
+
+  // === Llama a Groq con historial para no perder el hilo ===
   try {
+    const cid = extractConversationId(req.body)
+    const prior = cid ? (hist.get(cid) || []) : []
+
+    const messages = [
+      {
+        role: 'system',
+        content:
+`Eres un asistente profesional de Axioma Creativa (Madrid).
+Estilo: claro, conciso y cercano; evita divagar.
+Si preguntan por precios o tarifas, explica que cada caso requiere entender objetivos, alcance y plazos; invita a agendar videollamada en ${CTA_URL}.
+Solo si el usuario insiste en números, puedes dar rangos muy orientativos, pero prioriza la llamada.
+Mantén coherencia con el contexto previo.`
+      },
+      ...prior.map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: userMessage }
+    ]
+
     if (isTruthy(LOG_DECISIONS)) log(`[${reqId}] ⇢ GROQ model=${GROQ_MODEL} url=${GROQ_URL}`)
     const g = await axios.post(GROQ_URL, {
       model: GROQ_MODEL,
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Eres un asistente alegre y amigable de Axioma Creativa. Hablas con emojis, frases cortas y tono cercano. Genera interés y guía a la acción, debes mantener coherencia en las conversaciones, si te piden precios hay que explicar que se necesita realizar un estudio del negocio , y eso lo haremos con una videollamada , que pueden solicitar en esta direccion https://meet.brevo.com/axioma-creativa-ia/asesoria-flujos-de-trabajo.'
-        },
-        { role: 'user', content: userMessage }
-      ],
-      temperature: 0.8,
-      max_tokens: 300
+      messages,
+      temperature: 0.6,
+      max_tokens: 320
     }, {
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
       timeout: 15000
@@ -183,15 +239,23 @@ app.post('/chat', async (req, res) => {
       log(`[${reqId}] ⇠ GROQ status=${g.status}`)
     }
 
-    const botReply = g.data?.choices?.[0]?.message?.content?.trim()
-    if (!botReply) {
-      log(`[${reqId}] ⚠️ Respuesta vacía de GROQ`)
-      return res.status(200).json({ content: 'Ups, no pude responder ahora 😅', private: false })
+    let botReply = g.data?.choices?.[0]?.message?.content?.trim()
+    if (!botReply) botReply = 'Puedo ayudarte con más detalles en una videollamada.\n📅 Agenda aquí: ' + CTA_URL
+
+    // Refuerzo suave del CTA si la respuesta no lo incluye
+    if (!botReply.includes(CTA_URL)) {
+      botReply += `\n\n📅 ¿Agendamos? ${CTA_URL}`
     }
 
-    log(`[${reqId}] ⇢ BotReply: ${botReply.slice(0, 120)}${botReply.length > 120 ? '…' : ''}`)
+    // Guardar historial
+    if (cid) {
+      const arr = hist.get(cid) || []
+      arr.push({ role: 'user', content: userMessage, ts: Date.now() })
+      arr.push({ role: 'assistant', content: botReply, ts: Date.now() })
+      hist.set(cid, arr.slice(-HISTORY_MAX))
+    }
 
-    // Responder al webhook rápido
+    // Responder al webhook
     res.status(200).json({ content: botReply, private: false })
 
     // Publicar en Chatwoot si está activado
@@ -201,24 +265,19 @@ app.post('/chat', async (req, res) => {
 
       if (!conversationId) {
         log(`[${reqId}] ⚠️ No hay conversation.id en payload → no envío a Chatwoot`)
-        return
-      }
-
-      try {
-        const urlPreview = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`
-        log(`[${reqId}] ⇢ POST Chatwoot → ${urlPreview} (xheader=${CHATWOOT_AUTH_MODE === 'xheader'})`)
-
-        const resp = await postToChatwoot({
-          accountId,
-          conversationId,
-          content: botReply
-        })
-
-        log(`[${reqId}] ⇠ Chatwoot status=${resp.status} id=${resp.data?.id ?? resp.data?.message?.id ?? 'n/a'}`)
-      } catch (e) {
-        const status = e?.response?.status
-        const data = e?.response?.data
-        log(`[${reqId}] ❌ Chatwoot POST error status=${status} body=${JSON.stringify(data)}`)
+      } else {
+        try {
+          const resp = await postToChatwoot({
+            accountId,
+            conversationId,
+            content: botReply
+          })
+          log(`[${reqId}] ⇠ Chatwoot status=${resp.status} id=${resp.data?.id ?? resp.data?.message?.id ?? 'n/a'}`)
+        } catch (e) {
+          const status = e?.response?.status
+          const data = e?.response?.data
+          log(`[${reqId}] ❌ Chatwoot POST error status=${status} body=${JSON.stringify(data)}`)
+        }
       }
     }
 
@@ -227,7 +286,10 @@ app.post('/chat', async (req, res) => {
     const data = err?.response?.data || err.message
     log(`[${reqId}] ❌ GROQ error status=${status} body=${JSON.stringify(data)}`)
     // Devolvemos 200 para evitar reintentos infinitos del webhook
-    return res.status(200).json({ content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo?', private: false })
+    return res.status(200).json({
+      content: 'Ahora mismo estoy saturado 😅, ¿probamos de nuevo en breve?\n📅 También puedes agendar: ' + CTA_URL,
+      private: false
+    })
   }
 })
 
