@@ -137,6 +137,18 @@ async function postToChatwoot({ accountId, conversationId, content }) {
     private: false
   }, { headers: cwHeaders(), timeout: 15000 })
 }
+
+// >>> NUEVO: abrir conversación (de pending a open) <<<
+async function openConversation(accountId, conversationId) {
+  try {
+    let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/conversations/${conversationId}/toggle_status`
+    url = withToken(url)
+    return await axios.post(url, { status: 'open' }, { headers: cwHeaders(), timeout: 15000 })
+  } catch (e) {
+    log('⚠️ No se pudo abrir la conversación:', e?.response?.status, e?.response?.data || e.message)
+  }
+}
+
 async function createContactAndConversation(accountId, name, email, phone) {
   // Solo para integraciones sin widget (AUTOCREATE=1)
   let url = `${CHATWOOT_URL}/api/v1/accounts/${accountId}/contacts`
@@ -255,6 +267,7 @@ Para darte un presupuesto serio, mejor agendamos una breve videollamada.
       await sleep(300) // pequeño delay para evitar carreras
       if (isTruthy(REPLY_VIA_API)) {
         await postToChatwoot({ accountId, conversationId, content })
+        await openConversation(accountId, conversationId) // <<< NUEVO
         log(`[${reqId}] ✅ Precio → publicado conv=${conversationId}`)
       }
       const arr = hist.get(conversationId) || []
@@ -304,6 +317,7 @@ Mantén coherencia con el contexto previo.`
     if (isTruthy(REPLY_VIA_API)) {
       await sleep(300)
       const resp = await postToChatwoot({ accountId, conversationId, content: botReply })
+      await openConversation(accountId, conversationId) // <<< NUEVO
       log(`[${reqId}] ✅ GROQ → publicado status=${resp.status} conv=${conversationId}`)
     }
 
@@ -320,6 +334,7 @@ Mantén coherencia con el contexto previo.`
     try {
       const fallback = `Ahora mismo estoy saturado 😅. ¿Te va bien agendar una breve videollamada?\n📅 ${CTA_URL}`
       await postToChatwoot({ accountId, conversationId, content: fallback })
+      await openConversation(accountId, conversationId) // <<< NUEVO
     } catch {}
   }
 })
